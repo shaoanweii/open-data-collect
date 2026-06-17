@@ -22,18 +22,26 @@ export interface ApiErrorPayload {
 
 export interface LoginStatus {
   is_logged_in: boolean;
+  username?: string;
 }
 
 export interface LoginQrCode {
   qr_code?: string;
+  timeout?: string;
+  is_logged_in?: boolean;
+  img?: string;
 }
 
 export interface SearchFilters {
+  sort_by: SortBy;
+  note_type: NoteType;
+  publish_time: PublishTime;
+  search_scope: SearchScope;
+  location: LocationFilter;
   sortBy?: SortBy;
   noteType?: NoteType;
   publishTime?: PublishTime;
   searchScope?: SearchScope;
-  location?: LocationFilter;
 }
 
 export interface SearchRequest {
@@ -43,19 +51,26 @@ export interface SearchRequest {
 }
 
 export interface CommentConfig {
-  enable_comment_collect: boolean;
-  max_comments_per_post: number;
-  include_sub_comments: boolean;
-  max_sub_comments_per_comment: number;
+  max_comment_items: number;
+  click_more_replies: boolean;
+  max_replies_threshold: number;
+  scroll_speed: ScrollSpeed;
+  enable_comment_collect?: boolean;
+  max_comments_per_post?: number;
+  include_sub_comments?: boolean;
+  max_sub_comments_per_comment?: number;
 }
 
 export interface FeedDetailRequest {
   feed_id: string;
   xsec_token: string;
+  load_all_comments?: boolean;
+  comment_config?: CommentConfig;
 }
 
 export interface UserProfileRequest {
-  userId: string;
+  user_id?: string;
+  userId?: string;
   xsec_token: string;
 }
 
@@ -64,6 +79,7 @@ export interface FeedCardUser {
   xsecToken?: string;
   xsec_token?: string;
   nickname?: string;
+  nickName?: string;
   avatar?: string;
   redId?: string;
   verified?: boolean;
@@ -77,6 +93,8 @@ export interface FeedCardInteractInfo {
 }
 
 export interface FeedCardCover {
+  urlPre?: string;
+  urlDefault?: string;
   url?: string;
   type?: string;
   width?: number;
@@ -101,12 +119,14 @@ export interface SearchFeedItem {
 
 export interface SearchResponseData {
   success?: boolean;
-  feeds?: SearchFeedItem[];
+  feeds: SearchFeedItem[];
+  count?: number;
   total?: number;
 }
 
 export interface NoteDetail {
   noteId?: string;
+  xsecToken?: string;
   title?: string;
   desc?: string;
   type?: string;
@@ -132,19 +152,23 @@ export interface SubComment {
   userInfo?: CommentUserInfo;
   ipLocation?: string;
   createTime?: number;
+  showTags?: string[];
 }
 
 export interface FeedComment {
   id?: string;
+  noteId?: string;
   content?: string;
+  likeCount?: string;
   userInfo?: CommentUserInfo;
   ipLocation?: string;
   createTime?: number;
+  subCommentCount?: string;
   subComments?: SubComment[];
 }
 
 export interface FeedDetailData {
-  feed_id?: string;
+  feed_id: string;
   success?: boolean;
   data?: {
     note?: NoteDetail;
@@ -159,6 +183,22 @@ export interface FeedDetailData {
 export interface UserProfileData {
   success?: boolean;
   data?: {
+    userBasicInfo?: {
+      gender?: number;
+      ipLocation?: string;
+      desc?: string;
+      nickname?: string;
+      redId?: string;
+      avatar?: string;
+      images?: string | string[] | Array<{ url?: string; urlDefault?: string; urlPre?: string }>;
+      imageb?: string | string[] | Array<{ url?: string; urlDefault?: string; urlPre?: string }>;
+      fansCount?: string;
+      followsCount?: string;
+      followingCount?: string;
+      likedAndCollectedCount?: string;
+      likedCount?: string;
+      collectedCount?: string;
+    };
     user?: {
       userId?: string;
       nickname?: string;
@@ -172,17 +212,27 @@ export interface UserProfileData {
       interactions?: Array<{ type?: string; name?: string; count?: string | number }>;
       likedAndCollectedCount?: string | number;
     };
+    interactions?: Array<{ type?: string; name?: string; count?: string | number }>;
+    fansCount?: string;
+    followsCount?: string;
+    followingCount?: string;
+    likedAndCollectedCount?: string;
+    likedCount?: string;
+    collectedCount?: string;
+    feeds?: unknown[];
   };
 }
 
 export interface CollectOptions {
-  searchLimit: number;
-  maxComments: number;
-  commentOrder: "hot" | "time";
-  scrollSpeed: ScrollSpeed;
-  includeSubComments: boolean;
+  searchLimit?: number;
+  maxDetailConcurrency: number;
+  requestDelayMs: number;
   includeUserProfiles: boolean;
   commentConfig: CommentConfig;
+  maxComments?: number;
+  commentOrder?: "hot" | "time";
+  scrollSpeed?: ScrollSpeed;
+  includeSubComments?: boolean;
 }
 
 export interface QueueItem {
@@ -194,12 +244,13 @@ export interface QueueItem {
   searchItem: SearchFeedItem;
   status: "queued" | "fetching" | "completed" | "failed" | "skipped";
   error?: string;
+  detail?: FeedDetailData;
 }
 
 export interface TaskLog {
   id: string;
   time: string;
-  type: "task" | "search" | "request" | "response" | "error" | "debug";
+  type: "task" | "search" | "post" | "comment" | "user" | "request" | "response" | "error" | "debug";
   title: string;
   message: string;
   payload?: unknown;
@@ -220,7 +271,8 @@ export interface CollectionTask {
   failed: number;
   message: string;
   items: QueueItem[];
-  errors: Array<{ time: string; message: string }>;
+  rawSearch?: SearchResponseData;
+  errors: string[];
   logs: TaskLog[];
 }
 
@@ -262,6 +314,7 @@ export interface StoredUser {
   userId: string;
   nickname?: string;
   avatar?: string;
+  gender?: number;
   redId?: string;
   ipLocation?: string;
   desc?: string;

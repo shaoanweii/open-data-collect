@@ -88,7 +88,7 @@ export async function runCollectionTask(
     const items = search.feeds
       .filter((item) => item.modelType === "note" && item.id && item.xsecToken)
       .map<QueueItem>((item) => ({
-        feedId: item.id,
+        feedId: item.id ?? "",
         xsecToken: item.xsecToken ?? "",
         title: item.noteCard?.displayTitle || "未命名帖子",
         authorName: item.noteCard?.user?.nickname || item.noteCard?.user?.nickName || "未知作者",
