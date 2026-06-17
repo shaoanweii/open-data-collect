@@ -193,25 +193,34 @@ export class LocalPersistenceAdapter implements PersistenceAdapter {
 }
 
 class ServerBackedPersistenceAdapter extends LocalPersistenceAdapter {
+  // 写操作优先写后端 PG，localStorage 仅作为镜像缓存；后端不可用时降级为仅本地存储
+
   async saveTask(task: CollectionTask) {
-    await super.saveTask(task);
-    await this.syncRemote("/api/storage/task", {
+    const remoteOk = await this.syncRemote("/api/storage/task", {
       method: "POST",
       body: JSON.stringify(task),
     });
+    if (remoteOk) {
+      await super.saveTask(task); // PG 写入成功后镜像到 localStorage
+    } else {
+      await super.saveTask(task); // 后端不可用，降级为本地存储
+    }
   }
 
   async updateTaskStatus(taskId: string, status: CollectionTask["status"], message?: string) {
-    const task = await super.updateTaskStatus(taskId, status, message);
-    const payload = await this.syncRemote<{ task: CollectionTask | null }>(`/api/storage/task/${encodeURIComponent(taskId)}/status`, {
+    const remotePayload = await this.syncRemote<{ task: CollectionTask | null }>(`/api/storage/task/${encodeURIComponent(taskId)}/status`, {
       method: "PATCH",
       body: JSON.stringify({ status, message }),
     });
-    return payload?.task ?? task;
+    if (remotePayload?.task) {
+      const task = await super.updateTaskStatus(taskId, status, message);
+      return remotePayload.task ?? task;
+    }
+    // 后端不可用，降级到本地
+    return super.updateTaskStatus(taskId, status, message);
   }
 
   async deleteTask(taskId: string) {
-    const localCache = await super.deleteTask(taskId);
     const remoteCache = await this.syncRemote<LocalCache>(`/api/storage/task/${encodeURIComponent(taskId)}`, {
       method: "DELETE",
     });
@@ -219,11 +228,10 @@ class ServerBackedPersistenceAdapter extends LocalPersistenceAdapter {
       this.write(remoteCache);
       return remoteCache;
     }
-    return localCache;
+    return super.deleteTask(taskId);
   }
 
   async deletePosts(targets: Array<{ taskId: string; feedId: string }>) {
-    const localCache = await super.deletePosts(targets);
     const remoteCache = await this.syncRemote<LocalCache>("/api/storage/posts", {
       method: "DELETE",
       body: JSON.stringify({ targets }),
@@ -232,41 +240,53 @@ class ServerBackedPersistenceAdapter extends LocalPersistenceAdapter {
       this.write(remoteCache);
       return remoteCache;
     }
-    return localCache;
+    return super.deletePosts(targets);
   }
 
   async savePost(post: StoredPost) {
-    await super.savePost(post);
-    await this.syncRemote("/api/storage/post", {
+    const remoteOk = await this.syncRemote("/api/storage/post", {
       method: "POST",
       body: JSON.stringify(post),
     });
+    if (remoteOk) {
+      await super.savePost(post); // PG 写入成功后镜像到 localStorage
+    } else {
+      await super.savePost(post); // 后端不可用，降级为本地存储
+    }
   }
 
   async saveComments(comments: StoredComment[]) {
-    await super.saveComments(comments);
-    await this.syncRemote("/api/storage/comments", {
+    const remoteOk = await this.syncRemote("/api/storage/comments", {
       method: "POST",
       body: JSON.stringify(comments),
     });
+    if (remoteOk) {
+      await super.saveComments(comments); // PG 写入成功后镜像到 localStorage
+    } else {
+      await super.saveComments(comments); // 后端不可用，降级为本地存储
+    }
   }
 
   async saveUser(user: StoredUser) {
-    await super.saveUser(user);
-    await this.syncRemote("/api/storage/user", {
+    const remoteOk = await this.syncRemote("/api/storage/user", {
       method: "POST",
       body: JSON.stringify(user),
     });
+    if (remoteOk) {
+      await super.saveUser(user); // PG 写入成功后镜像到 localStorage
+    } else {
+      await super.saveUser(user); // 后端不可用，降级为本地存储
+    }
   }
 
+  // 读操作优先从后端 PG 加载，localStorage 作为离线兜底
   async loadRemoteCache() {
     const remoteCache = await this.syncRemote<LocalCache>("/api/storage/cache");
-    // 远程 PG 是唯一数据源，始终以远程数据为准同步到本地
     if (remoteCache) {
-      this.write(remoteCache);
+      this.write(remoteCache); // 后端数据同步到 localStorage
       return remoteCache;
     }
-    return this.loadCache();
+    return this.loadCache(); // 后端不可用，降级到本地缓存
   }
 
   private async syncRemote<T = unknown>(path: string, init: RequestInit = {}) {
