@@ -2864,28 +2864,29 @@ button:disabled {
 .user-list-table-head,
 .user-list-table-row {
   display: grid;
-  grid-template-columns: 2fr 0.8fr 0.7fr 0.7fr 0.8fr 0.9fr;
-  gap: 12px;
+  grid-template-columns: minmax(130px, 2fr) minmax(60px, 0.7fr) minmax(60px, 0.7fr) minmax(60px, 0.7fr) minmax(60px, 0.8fr) minmax(70px, 0.9fr);
+  gap: 16px;
   align-items: center;
-  padding: 10px 20px;
-  font-size: 12px;
+  min-height: 56px;
+  padding: 0 14px;
 }
 
 .user-list-table-head {
-  color: #7a8c86;
-  font-weight: 700;
-  background: rgba(239, 248, 244, 0.5);
-  border-bottom: 1px solid #dfeae5;
+  color: #4d615a;
+  font-size: 12px;
+  font-weight: 800;
+  background: rgba(239, 248, 244, 0.92);
+  border-bottom: 1px solid #e8f0ec;
   position: sticky;
   top: 0;
   z-index: 1;
 }
 
 .user-list-table-row {
-  border-bottom: 1px solid #f0f5f3;
-}
-.user-list-table-row:last-child {
-  border-bottom: none;
+  border-top: 1px solid #e8f0ec;
+  color: #52615c;
+  background: rgba(255, 255, 255, 0.52);
+  font-size: 13px;
 }
 
 .user-list-cell-name {

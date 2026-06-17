@@ -1714,13 +1714,13 @@ function CommentTable({ comments, users }: { comments: StoredComment[]; users: S
   }
 
   return (
-    <section className="data-panel glass" style={{ overflowY: "auto" }}>
+    <section className="data-panel glass" style={{ overflow: "hidden", display: "grid", gridTemplateRows: "auto minmax(0, 1fr) auto" }}>
       <div className="panel-heading">
         <div>
           <h3>评论池</h3>
         </div>
       </div>
-      <div className="table">
+      <div className="table" style={{ overflowY: "auto", minHeight: 0 }}>
         <div className="comments-table-head">
           <span>内容</span>
           <span>用户名</span>
