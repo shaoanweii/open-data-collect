@@ -2,6 +2,15 @@ import http from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import pg from "pg";
+import {
+  ensureClueAnalysisSchema,
+  getClueAnalysisJob,
+  getClueCandidates,
+  getClueScopes,
+  getLatestClueResults,
+  getLlmMetrics,
+  startClueAnalysis,
+} from "./clue-analysis.mjs";
 
 loadLocalEnv();
 
@@ -94,16 +103,56 @@ const server = http.createServer(async (request, response) => {
 
     // 用户画像分析聚合接口
     if (request.method === "GET" && url.pathname === "/api/storage/analytics") {
-      sendJson(response, await fetchAnalytics());
+      const startDate = url.searchParams.get("startDate") || "";
+      const endDate = url.searchParams.get("endDate") || "";
+      sendJson(response, await fetchAnalytics(startDate, endDate));
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/clues/scopes") {
+      sendJson(response, { tasks: await getClueScopes(pool) });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/clues/candidates") {
+      const taskId = url.searchParams.get("taskId") || null;
+      sendJson(response, { candidates: await getClueCandidates(pool, { taskId }) });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/clues/results") {
+      const taskId = url.searchParams.get("taskId") || null;
+      sendJson(response, { results: await getLatestClueResults(pool, { taskId }) });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/clues/analyze") {
+      const payload = await readJson(request);
+      const job = await startClueAnalysis(pool, {
+        taskId: payload.taskId || null,
+        userIds: Array.isArray(payload.userIds) ? payload.userIds : [],
+      });
+      sendJson(response, { job }, 202);
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname.startsWith("/api/clues/jobs/")) {
+      const jobId = decodeURIComponent(url.pathname.replace("/api/clues/jobs/", ""));
+      const job = await getClueAnalysisJob(pool, jobId);
+      sendJson(response, job ? { job } : { error: "Analysis job not found" }, job ? 200 : 404);
       return;
     }
 
     sendJson(response, { error: "Not found" }, 404);
   } catch (error) {
-    sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 500);
+    sendJson(response, {
+      error: error instanceof Error ? error.message : String(error),
+      jobId: error?.jobId,
+    }, Number(error?.statusCode) || 500);
   }
 });
 
+await ensureClueAnalysisSchema(pool);
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`storage api listening on http://127.0.0.1:${PORT}`);
 });
@@ -125,45 +174,161 @@ async function loadCache() {
 }
 
 // 用户画像分析聚合查询
-async function fetchAnalytics() {
+async function fetchAnalytics(startDate = "", endDate = "") {
+  // 构建任务时间过滤条件
+  const taskDateFilter = (startDate || endDate) ? `
+    AND created_at >= $1::timestamptz
+    AND created_at <  $2::timestamptz + INTERVAL '1 day'
+  ` : "";
+  // 构建关联表过滤（帖子/评论/用户，通过 task_id 子查询）
+  const relatedDateFilter = (startDate || endDate) ? `
+    WHERE task_id IN (
+      SELECT id FROM open_collection_task
+      WHERE created_at >= $1::timestamptz
+        AND created_at <  $2::timestamptz + INTERVAL '1 day'
+    )
+  ` : "";
+  // 任务趋势：用日期范围构建序列
+  const trendRange = (startDate && endDate) ? `
+    SELECT TO_CHAR(days.day, 'YYYY-MM-DD') AS date, COUNT(tasks.id)::int AS count
+    FROM GENERATE_SERIES($1::date, $2::date, INTERVAL '1 day') AS days(day)
+    LEFT JOIN open_collection_task tasks
+      ON tasks.created_at >= days.day
+     AND tasks.created_at < days.day + INTERVAL '1 day'
+    GROUP BY days.day
+    ORDER BY days.day
+  ` : `
+    SELECT TO_CHAR(days.day, 'YYYY-MM-DD') AS date, COUNT(tasks.id)::int AS count
+    FROM GENERATE_SERIES(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day') AS days(day)
+    LEFT JOIN open_collection_task tasks
+      ON tasks.created_at >= days.day
+     AND tasks.created_at < days.day + INTERVAL '1 day'
+    GROUP BY days.day
+    ORDER BY days.day
+  `;
+  const params = (startDate || endDate) ? [startDate || "1970-01-01", endDate || "2099-12-31"] : [];
+
   const [
+    summaryResult,
+    taskStatusResult,
+    taskTrendResult,
     channelTaskResult,
     channelPostResult,
     channelCommentResult,
     channelUserResult,
     ipLocationResult,
+    topAuthorResult,
+    topCommenterResult,
+    recentTaskResult,
+    llmMetricsResult,
   ] = await Promise.all([
+    pool.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM open_collection_task WHERE 1=1 ${taskDateFilter}) AS tasks,
+        (SELECT COUNT(*)::int FROM open_post ${relatedDateFilter}) AS posts,
+        (SELECT COUNT(*)::int FROM open_comment ${relatedDateFilter}) AS comments,
+        (SELECT COUNT(*)::int FROM open_user_profile ${relatedDateFilter}) AS users
+    `, params),
+    pool.query(`
+      SELECT status, COUNT(*)::int AS count
+      FROM open_collection_task
+      WHERE 1=1 ${taskDateFilter}
+      GROUP BY status
+      ORDER BY count DESC
+    `, params),
+    pool.query(trendRange, params),
     // 渠道任务数分布
-    pool.query(`SELECT channel, COUNT(*)::int as count FROM open_collection_task GROUP BY channel ORDER BY count DESC`),
+    pool.query(`SELECT channel, COUNT(*)::int as count FROM open_collection_task WHERE 1=1 ${taskDateFilter} GROUP BY channel ORDER BY count DESC`, params),
     // 渠道帖子数分布
-    pool.query(`SELECT source_channel as channel, COUNT(*)::int as count FROM open_post GROUP BY source_channel ORDER BY count DESC`),
-    // 渠道评论数分布（JOIN open_post 获取 source_channel）
+    pool.query(`SELECT source_channel as channel, COUNT(*)::int as count FROM open_post ${relatedDateFilter} GROUP BY source_channel ORDER BY count DESC`, params),
+    // 渠道评论数分布
     pool.query(`
       SELECT COALESCE(p.source_channel, '未知') as channel, COUNT(*)::int as count
       FROM open_comment c
       LEFT JOIN open_post p ON c.task_id = p.task_id AND c.feed_id = p.feed_id
+      ${relatedDateFilter ? `WHERE c.task_id IN (SELECT id FROM open_collection_task WHERE 1=1 ${taskDateFilter})` : ""}
       GROUP BY p.source_channel
       ORDER BY count DESC
-    `),
+    `, params),
     // 渠道用户数分布
-    pool.query(`SELECT source_channel as channel, COUNT(*)::int as count FROM open_user_profile GROUP BY source_channel ORDER BY count DESC`),
+    pool.query(`SELECT source_channel as channel, COUNT(*)::int as count FROM open_user_profile ${relatedDateFilter} GROUP BY source_channel ORDER BY count DESC`, params),
     // 用户 IP 属地分布（TOP 20）
     pool.query(`
       SELECT ip_location, COUNT(*)::int as count
       FROM open_user_profile
-      WHERE ip_location IS NOT NULL AND ip_location != ''
+      ${relatedDateFilter ? `${relatedDateFilter} AND` : "WHERE"} ip_location IS NOT NULL AND ip_location != ''
       GROUP BY ip_location
       ORDER BY count DESC
       LIMIT 20
-    `),
+    `, params),
+    pool.query(`
+      SELECT
+        COALESCE(author_user_id, author_nickname, 'unknown-author') AS id,
+        COALESCE(MAX(author_nickname), MAX(author_user_id), '未知作者') AS name,
+        MAX(author_avatar) AS avatar,
+        COUNT(*)::int AS count
+      FROM open_post
+      ${relatedDateFilter}
+      GROUP BY COALESCE(author_user_id, author_nickname, 'unknown-author')
+      ORDER BY count DESC
+      LIMIT 6
+    `, params),
+    pool.query(`
+      SELECT
+        COALESCE(comments.user_id, comments.nickname, 'unknown-commenter') AS id,
+        COALESCE(MAX(comments.nickname), MAX(comments.user_id), '未知用户') AS name,
+        MAX(COALESCE(NULLIF(comments.avatar, ''), profiles.avatar)) AS avatar,
+        COUNT(*)::int AS count
+      FROM open_comment comments
+      LEFT JOIN (
+        SELECT user_id, MAX(avatar) AS avatar
+        FROM (
+          SELECT user_id, avatar
+          FROM open_user_profile
+          ${relatedDateFilter ? `WHERE task_id IN (SELECT id FROM open_collection_task WHERE 1=1 ${taskDateFilter})` : ""}
+          UNION ALL
+          SELECT author_user_id AS user_id, author_avatar AS avatar
+          FROM open_post
+          ${relatedDateFilter ? `WHERE task_id IN (SELECT id FROM open_collection_task WHERE 1=1 ${taskDateFilter})` : ""}
+        ) available_avatars
+        WHERE avatar IS NOT NULL AND avatar != '' AND user_id IS NOT NULL
+        GROUP BY user_id
+      ) profiles ON profiles.user_id = comments.user_id
+      ${relatedDateFilter ? `WHERE comments.task_id IN (SELECT id FROM open_collection_task WHERE 1=1 ${taskDateFilter})` : ""}
+      GROUP BY COALESCE(comments.user_id, comments.nickname, 'unknown-commenter')
+      ORDER BY count DESC
+      LIMIT 6
+    `, params),
+    pool.query(`
+      SELECT
+        id,
+        keyword,
+        status,
+        CASE
+          WHEN status = 'completed' THEN CONCAT('采集完成，共 ', total_count, ' 条主贴')
+          ELSE COALESCE(message, '')
+        END AS message,
+        created_at AS "createdAt"
+      FROM open_collection_task
+      WHERE 1=1 ${taskDateFilter}
+      ORDER BY created_at DESC
+    `, params),
+    getLlmMetrics(pool),
   ]);
 
   return {
+    summary: summaryResult.rows[0],
+    taskStatuses: taskStatusResult.rows,
+    taskTrend: taskTrendResult.rows,
     channelTasks: channelTaskResult.rows,
     channelPosts: channelPostResult.rows,
     channelComments: channelCommentResult.rows,
     channelUsers: channelUserResult.rows,
     ipLocations: ipLocationResult.rows,
+    topAuthors: topAuthorResult.rows,
+    topCommenters: topCommenterResult.rows,
+    recentTasks: recentTaskResult.rows,
+    llmMetrics: llmMetricsResult,
   };
 }
 

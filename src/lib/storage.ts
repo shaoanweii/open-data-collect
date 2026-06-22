@@ -150,36 +150,21 @@ export class LocalPersistenceAdapter implements PersistenceAdapter {
     return this.loadCache();
   }
 
+  // 仅移除启动时可能遗留的"正在运行"状态任务（app 异常关闭的场景）
   cleanupStaleActiveTasks() {
     const cache = this.loadCache();
-    let changed = false;
-
-    // 移除卡在 running/queued 的僵尸任务
     const staleCount = cache.tasks.filter(
-      (task) => task.status === "running" || task.status === "queued",
+      (task) => task.status === "running",
     ).length;
-
-    const tasks = cache.tasks
-      .filter((task) => task.status !== "running" && task.status !== "queued")
-      .map((task) => {
-        // 迁移旧数据：已采集完成但被标记为"失败"的任务 → 修正为"已完成"
-        if (task.status === "failed" && task.items.length > 0) {
-          const allProcessed = task.items.every(
-            (item) =>
-              item.status === "completed" || item.status === "failed" || item.status === "skipped",
-          );
-          if (allProcessed) {
-            changed = true;
-            return { ...task, status: "completed" as const };
-          }
-        }
-        return task;
-      });
-
-    if (staleCount > 0 || changed) {
-      this.write({ ...cache, tasks });
+    if (staleCount === 0) {
+      return { cache, removedCount: 0 };
     }
-
+    const tasks = cache.tasks.map((task) =>
+      task.status === "running"
+        ? { ...task, status: "queued" as const, message: "上次运行中离开，已重置为排队" }
+        : task,
+    );
+    this.write({ ...cache, tasks });
     return { cache: { ...cache, tasks }, removedCount: staleCount };
   }
 
@@ -193,49 +178,75 @@ export class LocalPersistenceAdapter implements PersistenceAdapter {
 }
 
 class ServerBackedPersistenceAdapter extends LocalPersistenceAdapter {
-  // 写操作优先写后端 PG，localStorage 仅作为镜像缓存；后端不可用时降级为仅本地存储
+  // PG 为主数据源，localStorage 为镜像缓存
+  // 写操作：PG 写入 → localStorage 镜像 → 返回 PG 确认后的数据
+  // 读操作：PG 加载 → localStorage 镜像 → 返回 PG 数据
+  // PG 不可达时降级到 localStorage（离线兜底）
 
-  async saveTask(task: CollectionTask) {
-    const remoteOk = await this.syncRemote("/api/storage/task", {
-      method: "POST",
-      body: JSON.stringify(task),
-    });
-    if (remoteOk) {
-      await super.saveTask(task); // PG 写入成功后镜像到 localStorage
-    } else {
-      await super.saveTask(task); // 后端不可用，降级为本地存储
+  // 页面加载：localStorage 为准；PG 数据仅作为冷启动种子
+  async loadRemoteCache() {
+    const localCache = this.loadCache();
+    // localStorage 有数据时信任本地（避免 PG 旧数据覆盖本地操作）
+    if (localCache.tasks.length > 0 || localCache.posts.length > 0) {
+      return localCache;
     }
-  }
-
-  async updateTaskStatus(taskId: string, status: CollectionTask["status"], message?: string) {
-    const remotePayload = await this.syncRemote<{ task: CollectionTask | null }>(`/api/storage/task/${encodeURIComponent(taskId)}/status`, {
-      method: "PATCH",
-      body: JSON.stringify({ status, message }),
-    });
-    if (remotePayload?.task) {
-      const task = await super.updateTaskStatus(taskId, status, message);
-      return remotePayload.task ?? task;
-    }
-    // 后端不可用，降级到本地
-    return super.updateTaskStatus(taskId, status, message);
-  }
-
-  async deleteTask(taskId: string) {
-    const remoteCache = await this.syncRemote<LocalCache>(`/api/storage/task/${encodeURIComponent(taskId)}`, {
-      method: "DELETE",
-    });
+    // 本地为空（首次访问），从 PG 拉取
+    const remoteCache = await this.syncRemote<LocalCache>("/api/storage/cache");
     if (remoteCache) {
       this.write(remoteCache);
       return remoteCache;
     }
+    return localCache;
+  }
+
+  // ========== 写操作：PG 先写，成功后镜像到 localStorage ==========
+
+  async saveTask(task: CollectionTask) {
+    const ok = await this.syncRemote("/api/storage/task", {
+      method: "POST",
+      body: JSON.stringify(task),
+    });
+    if (ok) {
+      await super.saveTask(task); // PG 写入成功后镜像到 localStorage
+    } else {
+      await super.saveTask(task); // PG 不可达时降级到本地
+    }
+  }
+
+  async updateTaskStatus(taskId: string, status: CollectionTask["status"], message?: string) {
+    const payload = await this.syncRemote<{ task: CollectionTask | null }>(
+      `/api/storage/task/${encodeURIComponent(taskId)}/status`,
+      { method: "PATCH", body: JSON.stringify({ status, message }) },
+    );
+    if (payload?.task) {
+      // PG 返回最新任务数据，镜像到 localStorage
+      await super.saveTask(payload.task);
+      return payload.task;
+    }
+    // PG 不可达，降级到本地
+    return super.updateTaskStatus(taskId, status, message);
+  }
+
+  async deleteTask(taskId: string) {
+    // PG DELETE 返回完整的 cache（已在 PG 中删除）
+    const remoteCache = await this.syncRemote<LocalCache>(
+      `/api/storage/task/${encodeURIComponent(taskId)}`,
+      { method: "DELETE" },
+    );
+    if (remoteCache) {
+      // PG 删除成功，全量镜像到 localStorage
+      this.write(remoteCache);
+      return remoteCache;
+    }
+    // PG 不可达，降级到本地删除
     return super.deleteTask(taskId);
   }
 
   async deletePosts(targets: Array<{ taskId: string; feedId: string }>) {
-    const remoteCache = await this.syncRemote<LocalCache>("/api/storage/posts", {
-      method: "DELETE",
-      body: JSON.stringify({ targets }),
-    });
+    const remoteCache = await this.syncRemote<LocalCache>(
+      "/api/storage/posts",
+      { method: "DELETE", body: JSON.stringify({ targets }) },
+    );
     if (remoteCache) {
       this.write(remoteCache);
       return remoteCache;
@@ -244,66 +255,64 @@ class ServerBackedPersistenceAdapter extends LocalPersistenceAdapter {
   }
 
   async savePost(post: StoredPost) {
-    const remoteOk = await this.syncRemote("/api/storage/post", {
+    const ok = await this.syncRemote("/api/storage/post", {
       method: "POST",
       body: JSON.stringify(post),
     });
-    if (remoteOk) {
-      await super.savePost(post); // PG 写入成功后镜像到 localStorage
+    if (ok) {
+      await super.savePost(post);
     } else {
-      await super.savePost(post); // 后端不可用，降级为本地存储
+      await super.savePost(post);
     }
   }
 
   async saveComments(comments: StoredComment[]) {
-    const remoteOk = await this.syncRemote("/api/storage/comments", {
+    const ok = await this.syncRemote("/api/storage/comments", {
       method: "POST",
       body: JSON.stringify(comments),
     });
-    if (remoteOk) {
-      await super.saveComments(comments); // PG 写入成功后镜像到 localStorage
+    if (ok) {
+      await super.saveComments(comments);
     } else {
-      await super.saveComments(comments); // 后端不可用，降级为本地存储
+      await super.saveComments(comments);
     }
   }
 
   async saveUser(user: StoredUser) {
-    const remoteOk = await this.syncRemote("/api/storage/user", {
+    const ok = await this.syncRemote("/api/storage/user", {
       method: "POST",
       body: JSON.stringify(user),
     });
-    if (remoteOk) {
-      await super.saveUser(user); // PG 写入成功后镜像到 localStorage
+    if (ok) {
+      await super.saveUser(user);
     } else {
-      await super.saveUser(user); // 后端不可用，降级为本地存储
+      await super.saveUser(user);
     }
   }
 
-  // 读操作优先从后端 PG 加载，localStorage 作为离线兜底
-  async loadRemoteCache() {
-    const remoteCache = await this.syncRemote<LocalCache>("/api/storage/cache");
-    if (remoteCache) {
-      this.write(remoteCache); // 后端数据同步到 localStorage
-      return remoteCache;
-    }
-    return this.loadCache(); // 后端不可用，降级到本地缓存
-  }
+  // ========== 工具方法 ==========
 
-  private async syncRemote<T = unknown>(path: string, init: RequestInit = {}) {
+  private async syncRemote<T = unknown>(path: string, init: RequestInit = {}, timeoutMs = 5000): Promise<T | null> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(`${STORAGE_API_BASE_URL}${path}`, {
         ...init,
-        headers: {
-          "Content-Type": "application/json",
-          ...init.headers,
-        },
+        signal: controller.signal,
+        headers: { "Content-Type": "application/json", ...init.headers },
       });
+      clearTimeout(timer);
       if (!response.ok) {
         throw new Error(`Storage API ${response.status}`);
       }
       return (await response.json()) as T;
     } catch (error) {
-      console.warn("PostgreSQL storage sync skipped:", error);
+      clearTimeout(timer);
+      if ((error as Error).name === "AbortError") {
+        console.warn(`PG 请求超时 (${timeoutMs}ms): ${init.method || "GET"} ${path}`);
+      } else {
+        console.warn("PG 请求失败，降级到 localStorage:", error);
+      }
       return null;
     }
   }

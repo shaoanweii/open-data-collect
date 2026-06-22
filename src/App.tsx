@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type React from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
@@ -6,13 +6,16 @@ import {
   Lightbulb,
   ListChecks,
   MessageSquareText,
+  RefreshCw,
   Search,
   Settings,
   UserRound,
+  X,
 } from "lucide-react";
 import { apiClient } from "./lib/api";
 import { retryCollectionItem, runCollectionTask } from "./lib/collector";
 import { persistence } from "./lib/storage";
+import { taskControl } from "./lib/task-control";
 import { CollectPage } from "./pages/collect/CollectPage";
 import { CommentDataPage } from "./pages/comments/CommentDataPage";
 import { CluePoolPage } from "./pages/clue-pool/CluePoolPage";
@@ -37,17 +40,31 @@ import type {
 } from "./types";
 
 type ViewKey = "collect" | "tasks" | "posts" | "comments" | "users" | "clue_pool" | "userpool";
+type PendingCollectionRequest = {
+  keyword: string;
+  channel: string;
+  filters: SearchFilters;
+  options: CollectOptions;
+};
 
+type LoginDialogState = {
+  status: "loading" | "waiting" | "success" | "error";
+  message: string;
+  image?: string;
+  request: PendingCollectionRequest;
+};
+
+// 默认筛选条件使用小红书搜索页默认值（不触发浏览器点击交互）
 const defaultFilters: SearchFilters = {
-  location: "同城",
+  location: "不限",
   note_type: "不限",
-  publish_time: "一周内",
+  publish_time: "不限",
   search_scope: "不限",
-  sort_by: "最新",
+  sort_by: "综合",
 };
 
 const defaultOptions: CollectOptions = {
-  searchLimit: undefined,
+  searchLimit: 20,
   includeUserProfiles: true,
   maxDetailConcurrency: 1,
   requestDelayMs: 1500,
@@ -118,6 +135,9 @@ export function App() {
   const [users, setUsers] = useState<StoredUser[]>(cache.users);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedFeedId, setSelectedFeedId] = useState<string | null>(null);
+  const [focusedUserId, setFocusedUserId] = useState<string | null>(null);
+  const [loginDialog, setLoginDialog] = useState<LoginDialogState | null>(null);
+  const loginFlowIdRef = useRef(0);
   const uniqueUserCount = useMemo(() => countUniqueUsers(posts, comments, users), [posts, comments, users]);
   const [toast, setToast] = useState<ToastState | null>(
     startupCache.removedCount
@@ -138,12 +158,15 @@ export function App() {
     }, 2600);
   }
 
+  // 首次加载：尝试从 PG 恢复数据；若 PG 不可达或本地已有数据则信任 localStorage
   useEffect(() => {
     void persistence.loadRemoteCache().then((remoteCache) => {
       setTasks(remoteCache.tasks);
       setPosts(remoteCache.posts);
       setComments(remoteCache.comments);
       setUsers(remoteCache.users);
+    }).catch(() => {
+      // PG 不可达，使用 localStorage 兜底数据（已在初始化时加载）
     });
   }, []);
 
@@ -165,14 +188,154 @@ export function App() {
       return;
     }
 
+    const request = snapshotCollectionRequest(trimmedKeyword, channel, filters, options);
+    void prepareTaskWithLogin(request);
+  }
+
+  async function prepareTaskWithLogin(request: PendingCollectionRequest) {
     setIsRunning(true);
+    setNotice("正在检查采集账号登录状态");
+    showToast("success", "正在检查登录", "确认账号状态后再创建采集任务");
+
+    try {
+      const login = await apiClient.checkLoginStatus({
+        _timeout: 15000,
+        _timeoutMessage: "采集服务登录状态接口 15 秒无响应，请先重启 xiaohongshu-mcp",
+      });
+      if (login.is_logged_in) {
+        startCollectionTask(request);
+        return;
+      }
+
+      await openLoginQrFlow(request);
+    } catch (error) {
+      setIsRunning(false);
+      setNotice(errorToMessage(error));
+      showToast("error", "登录检查失败", errorToMessage(error));
+    }
+  }
+
+  async function openLoginQrFlow(request: PendingCollectionRequest) {
+    const flowId = loginFlowIdRef.current + 1;
+    loginFlowIdRef.current = flowId;
+    setIsRunning(true);
+    setNotice("等待采集账号登录");
+    setLoginDialog({
+      status: "loading",
+      message: "正在获取登录二维码",
+      request,
+    });
+
+    try {
+      const qrCode = await apiClient.getLoginQrCode({
+        _timeout: 30000,
+        _timeoutMessage: "获取登录二维码超时，请确认采集服务浏览器链路正常",
+      });
+      if (flowId !== loginFlowIdRef.current) {
+        return;
+      }
+      if (qrCode.is_logged_in) {
+        setLoginDialog({
+          status: "success",
+          message: "登录成功，正在启动采集任务",
+          request,
+        });
+        startCollectionTask(request);
+        return;
+      }
+
+      const image = normalizeQrImage(qrCode.img || qrCode.qr_code);
+      if (!image) {
+        throw new Error("二维码接口未返回图片");
+      }
+
+      setLoginDialog({
+        status: "waiting",
+        message: "请扫码完成登录",
+        image,
+        request,
+      });
+
+      const loggedIn = await pollLoginStatus(flowId, parseLoginTimeout(qrCode.timeout));
+      if (flowId !== loginFlowIdRef.current) {
+        return;
+      }
+      if (!loggedIn) {
+        throw new Error("二维码已超时，请重新获取二维码");
+      }
+
+      setLoginDialog({
+        status: "success",
+        message: "登录成功，正在启动采集任务",
+        image,
+        request,
+      });
+      startCollectionTask(request);
+    } catch (error) {
+      if (flowId !== loginFlowIdRef.current) {
+        return;
+      }
+      setIsRunning(false);
+      setNotice("登录未完成");
+      setLoginDialog({
+        status: "error",
+        message: errorToMessage(error),
+        request,
+      });
+      showToast("error", "登录失败", errorToMessage(error));
+    }
+  }
+
+  async function pollLoginStatus(flowId: number, timeoutMs: number) {
+    const deadline = Date.now() + timeoutMs;
+    let lastMessage = "";
+
+    while (Date.now() < deadline) {
+      await delay(2500);
+      if (flowId !== loginFlowIdRef.current) {
+        return false;
+      }
+
+      try {
+        const login = await apiClient.checkLoginStatus({
+          _timeout: 10000,
+          _timeoutMessage: "登录状态接口暂时无响应",
+        });
+        if (login.is_logged_in) {
+          return true;
+        }
+        lastMessage = "请扫码完成登录";
+      } catch (error) {
+        lastMessage = errorToMessage(error);
+      }
+
+      setLoginDialog((current) =>
+        current && current.status === "waiting" && flowId === loginFlowIdRef.current
+          ? { ...current, message: lastMessage }
+          : current,
+      );
+    }
+
+    return false;
+  }
+
+  function cancelLoginFlow() {
+    loginFlowIdRef.current += 1;
+    setLoginDialog(null);
+    setIsRunning(false);
+    setNotice("输入关键词后创建采集任务");
+  }
+
+  function startCollectionTask(request: PendingCollectionRequest) {
+    setIsRunning(true);
+    setLoginDialog(null);
     navigate("/job_queue");
     setSelectedTaskId(null);
     setSelectedFeedId(null);
     setNotice("任务启动中");
     showToast("success", "创建成功", "已进入任务队列，正在查询主贴数量");
 
-    void runCollectionTask(trimmedKeyword, channel, filters, options, {
+    void runCollectionTask(request.keyword, request.channel, request.filters, request.options, {
       onTaskUpdate: (task) => {
         setTasks((prev) => [task, ...prev.filter((item) => item.id !== task.id)]);
         setNotice(task.message);
@@ -188,6 +351,13 @@ export function App() {
       },
     })
       .then((task) => {
+        if (task.message === "任务已删除") {
+          return;
+        }
+        if (task.status === "paused") {
+          showToast("success", "任务已暂停", task.message);
+          return;
+        }
         if (task.status === "failed") {
           showToast("error", "采集失败", task.message);
         } else if (task.failed > 0) {
@@ -223,25 +393,36 @@ export function App() {
   }
 
   async function handleDeleteTask(taskId: string) {
-    const nextCache = await persistence.deleteTask(taskId);
-    setTasks(nextCache.tasks);
-    setPosts(nextCache.posts);
-    setComments(nextCache.comments);
-    setUsers(nextCache.users);
-    setSelectedTaskId((current) => (current === taskId ? null : current));
+    taskControl.delete(taskId);
+    setTasks((prev) => prev.filter((t) => t.id !== taskId));
+    setPosts((prev) => prev.filter((p) => p.taskId !== taskId));
+    setComments((prev) => prev.filter((c) => c.taskId !== taskId));
+    setUsers((prev) => prev.filter((u) => u.taskId !== taskId));
+    setSelectedTaskId((curr) => (curr === taskId ? null : curr));
     setSelectedFeedId(null);
-    showToast("success", "任务已删除", "已同步删除该任务的本地采集数据");
+    showToast("success", "任务已删除", "PG 同步中...");
+    // 后台写 PG，不阻塞 UI
+    persistence.deleteTask(taskId).then(() => {
+      showToast("success", "任务已删除", "PG 已同步删除");
+    }).catch(() => {
+      showToast("error", "删除失败", "PG 同步超时，本地已删除");
+    });
   }
 
   async function handleUpdateTaskStatus(taskId: string, status: CollectionTask["status"]) {
     const message = status === "paused" ? "任务已暂停" : "任务已恢复";
-    const task = await persistence.updateTaskStatus(taskId, status, message);
-    if (!task) {
-      showToast("error", "操作失败", "没有找到这个任务");
-      return;
-    }
-    setTasks((prev) => prev.map((item) => (item.id === taskId ? task : item)));
-    showToast("success", status === "paused" ? "已暂停" : "已恢复", message);
+    if (status === "paused") taskControl.pause(taskId);
+    setTasks((prev) =>
+      prev.map((item) =>
+        item.id === taskId ? { ...item, status, message: message ?? item.message } : item,
+      ),
+    );
+    showToast("success", status === "paused" ? "已暂停" : "已恢复", "PG 同步中...");
+    persistence.updateTaskStatus(taskId, status, message).then(() => {
+      showToast("success", status === "paused" ? "已暂停" : "已恢复", message);
+    }).catch(() => {
+      showToast("error", "操作失败", "PG 同步超时，本地已更新");
+    });
   }
 
   // 重试失败的任务，使用原条件重新采集
@@ -253,6 +434,7 @@ export function App() {
     }
 
     setIsRunning(true);
+    taskControl.begin(taskId);
     navigate("/job_queue");
     setSelectedTaskId(null);
     setSelectedFeedId(null);
@@ -275,6 +457,13 @@ export function App() {
       },
     }, taskId)
       .then((result) => {
+        if (result.message === "任务已删除") {
+          return;
+        }
+        if (result.status === "paused") {
+          showToast("success", "任务已暂停", result.message);
+          return;
+        }
         if (result.status === "failed") {
           showToast("error", "重试失败", result.message);
         } else if (result.failed > 0) {
@@ -316,6 +505,7 @@ export function App() {
 
     showToast("success", "已开始重采集", "正在重新读取这条主贴");
     try {
+      taskControl.begin(taskId);
       await retryCollectionItem(task, feedId, {
         onTaskUpdate: (nextTask) => {
           setTasks((prev) => [nextTask, ...prev.filter((item) => item.id !== nextTask.id)]);
@@ -400,6 +590,13 @@ export function App() {
   return (
     <div className="app-shell">
       {toast && <ToastCard toast={toast} />}
+      {loginDialog && (
+        <LoginQrModal
+          state={loginDialog}
+          onCancel={cancelLoginFlow}
+          onRetry={() => void openLoginQrFlow(loginDialog.request)}
+        />
+      )}
       <aside className="sidebar">
         <nav className="nav" aria-label="主导航">
           {navItems.map((item) => {
@@ -458,7 +655,7 @@ export function App() {
             onSelectFeed={setSelectedFeedId}
             onLoadCommentUser={handleLoadCommentUser}
             onPause={(taskId) => void handleUpdateTaskStatus(taskId, "paused")}
-            onResume={(taskId) => void handleUpdateTaskStatus(taskId, "running")}
+            onResume={(taskId) => void handleRetryTask(taskId)}
             onRetry={(taskId) => void handleRetryTask(taskId)}
             onDelete={(taskId) => void handleDeleteTask(taskId)}
           />
@@ -473,10 +670,150 @@ export function App() {
           />
         )}
         {view === "comments" && <CommentDataPage comments={comments} users={users} />}
-        {view === "users" && <SystemSettingsPage users={users} posts={posts} comments={comments} tasks={tasks} />}
-        {view === "userpool" && <UserPoolPage users={users} posts={posts} comments={comments} />}
-        {view === "clue_pool" && <CluePoolPage />}
+        {view === "users" && (
+          <SystemSettingsPage
+            key="pg-analytics-v6"
+            onOpenTask={(taskId) => {
+              setSelectedTaskId(taskId);
+              setSelectedFeedId(null);
+              navigate("/job_queue");
+            }}
+            onOpenTaskList={() => {
+              setSelectedTaskId(null);
+              setSelectedFeedId(null);
+              navigate("/job_queue");
+            }}
+            onOpenComments={() => navigate("/comment-data")}
+            onOpenUserPool={() => {
+              setFocusedUserId(null);
+              navigate("/user-pool");
+            }}
+            onOpenUser={(userId) => {
+              setFocusedUserId(userId);
+              navigate("/user-pool");
+            }}
+          />
+        )}
+        {view === "userpool" && (
+          <UserPoolPage
+            users={users}
+            posts={posts}
+            comments={comments}
+            focusedUserId={focusedUserId}
+          />
+        )}
+        {view === "clue_pool" && (
+          <CluePoolPage
+            onOpenUser={(userId) => {
+              setFocusedUserId(userId);
+              navigate("/user-pool");
+            }}
+            onNavigateToPost={(feedId) => {
+              setSelectedFeedId(feedId);
+              navigate("/tiezi-data");
+            }}
+          />
+        )}
       </main>
     </div>
   );
+}
+
+function LoginQrModal({
+  state,
+  onCancel,
+  onRetry,
+}: {
+  state: LoginDialogState;
+  onCancel: () => void;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="log-modal-backdrop" role="dialog" aria-modal="true">
+      <section className="login-modal glass">
+        <header className="log-modal-head">
+          <div>
+            <h3>采集账号登录</h3>
+            <p>{state.request.keyword}</p>
+          </div>
+          <div className="log-modal-actions">
+            {state.status === "error" && (
+              <button type="button" onClick={onRetry}>
+                <RefreshCw size={16} />
+                重新获取
+              </button>
+            )}
+            <button type="button" onClick={onCancel} title="关闭">
+              <X size={16} />
+            </button>
+          </div>
+        </header>
+
+        <div className="login-modal-body">
+          {state.image ? (
+            <img className="login-qr-image" src={state.image} alt="小红书登录二维码" />
+          ) : (
+            <div className="login-qr-placeholder">
+              {state.status === "loading" ? <RefreshCw className="spin" size={28} /> : <X size={28} />}
+            </div>
+          )}
+          <strong>{state.message}</strong>
+          <span>
+            {state.status === "waiting"
+              ? "登录成功后将自动创建采集任务"
+              : state.status === "success"
+                ? "正在进入任务队列"
+                : "请保持采集服务运行"}
+          </span>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function snapshotCollectionRequest(
+  keyword: string,
+  channel: string,
+  filters: SearchFilters,
+  options: CollectOptions,
+): PendingCollectionRequest {
+  return {
+    keyword,
+    channel,
+    filters: { ...filters },
+    options: {
+      ...options,
+      commentConfig: { ...options.commentConfig },
+    },
+  };
+}
+
+function normalizeQrImage(image?: string) {
+  if (!image) {
+    return undefined;
+  }
+  if (image.startsWith("data:") || image.startsWith("http://") || image.startsWith("https://")) {
+    return image;
+  }
+  return `data:image/png;base64,${image}`;
+}
+
+function parseLoginTimeout(timeout?: string) {
+  if (!timeout) {
+    return 4 * 60 * 1000;
+  }
+
+  const text = timeout.trim();
+  if (/^\d+$/.test(text)) {
+    return Number(text) * 1000;
+  }
+
+  const minute = Number(text.match(/(\d+)m/)?.[1] ?? 0);
+  const second = Number(text.match(/(\d+)s/)?.[1] ?? 0);
+  const parsedMs = (minute * 60 + second) * 1000;
+  return parsedMs > 0 ? parsedMs : 4 * 60 * 1000;
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }

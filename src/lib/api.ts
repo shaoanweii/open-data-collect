@@ -13,6 +13,11 @@ import type {
 
 const DEFAULT_BASE_URL = import.meta.env.VITE_XHS_MCP_BASE_URL || "http://127.0.0.1:18060";
 
+export type ApiRequestInit = RequestInit & {
+  _timeout?: number;
+  _timeoutMessage?: string;
+};
+
 export class ApiClient {
   private baseUrl: string;
 
@@ -28,62 +33,107 @@ export class ApiClient {
     return this.baseUrl;
   }
 
-  checkLoginStatus() {
-    return this.request<LoginStatus>("/api/v1/login/status");
+  checkLoginStatus(init: ApiRequestInit = {}) {
+    return this.request<LoginStatus>("/api/v1/login/status", init);
   }
 
-  getLoginQrCode() {
-    return this.request<LoginQrCode>("/api/v1/login/qrcode");
+  getLoginQrCode(init: ApiRequestInit = {}) {
+    return this.request<LoginQrCode>("/api/v1/login/qrcode", init);
   }
 
-  searchFeeds(payload: SearchRequest) {
+  searchFeeds(payload: SearchRequest, init: ApiRequestInit = {}) {
     return this.request<SearchResponseData>("/api/v1/analysis/search", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-  }
-
-  getFeedDetail(payload: FeedDetailRequest) {
-    return this.request<FeedDetailData>("/api/v1/analysis/feed-detail", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-  }
-
-  getUserProfile(payload: UserProfileRequest) {
-    return this.request<UserProfileData>("/api/v1/user/profile", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-  }
-
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
       ...init,
-      headers: {
-        "Content-Type": "application/json",
-        ...init.headers,
-      },
+      method: "POST",
+      body: JSON.stringify(payload),
     });
+  }
 
-    const payload = (await response.json().catch(() => null)) as
-      | ApiResponse<T>
-      | ApiErrorPayload
-      | null;
+  getFeedDetail(payload: FeedDetailRequest, init: ApiRequestInit = {}) {
+    return this.request<FeedDetailData>("/api/v1/analysis/feed-detail", {
+      ...init,
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
 
-    if (!response.ok || !payload) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText || "请求失败"}`);
+  getUserProfile(payload: UserProfileRequest, init: ApiRequestInit = {}) {
+    return this.request<UserProfileData>("/api/v1/user/profile", {
+      ...init,
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  private async request<T>(path: string, init: ApiRequestInit = {}): Promise<T> {
+    const {
+      _timeout,
+      _timeoutMessage,
+      signal: upstreamSignal,
+      ...fetchInit
+    } = init;
+    const timeoutMs = _timeout ?? 60000;
+    const controller = new AbortController();
+    let abortReason: "timeout" | "upstream" | null = null;
+    const abortFromUpstream = () => {
+      abortReason = "upstream";
+      controller.abort();
+    };
+    const timer = setTimeout(() => {
+      abortReason = "timeout";
+      controller.abort();
+    }, timeoutMs);
+    if (upstreamSignal?.aborted) {
+      abortFromUpstream();
+    } else {
+      upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
     }
 
-    if ("success" in payload && payload.success) {
-      return payload.data;
-    }
+    try {
+      const response = await fetch(`${this.baseUrl}${path}`, {
+        ...fetchInit,
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          ...fetchInit.headers,
+        },
+      });
 
-    if ("error" in payload) {
-      throw new Error(payload.details ? `${payload.error}: ${String(payload.details)}` : payload.error);
-    }
+      clearTimeout(timer);
 
-    throw new Error("接口返回格式不符合预期");
+      const payload = (await response.json().catch(() => null)) as
+        | ApiResponse<T>
+        | ApiErrorPayload
+        | null;
+
+      if (!response.ok || !payload) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText || "请求失败"}`);
+      }
+
+      if ("success" in payload && payload.success) {
+        return payload.data;
+      }
+
+      if ("error" in payload) {
+        throw new Error(payload.details ? `${payload.error}: ${String(payload.details)}` : payload.error);
+      }
+
+      throw new Error("接口返回格式不符合预期");
+    } catch (error) {
+      clearTimeout(timer);
+      if ((error as Error).name === "AbortError") {
+        if (abortReason === "upstream") {
+          throw error;
+        }
+        if (_timeoutMessage) {
+          throw new Error(_timeoutMessage);
+        }
+        throw new Error(`API 请求超时（${Math.round(timeoutMs / 1000)}s），MCP 采集服务可能卡住`);
+      }
+      throw error;
+    } finally {
+      upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+    }
   }
 }
 

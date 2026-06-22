@@ -331,9 +331,35 @@ export interface StoredUser {
 
 // 用户画像分析聚合数据
 export interface AnalyticsData {
+  summary: {
+    tasks: number;
+    posts: number;
+    comments: number;
+    users: number;
+  };
+  taskStatuses: Array<{ status: CollectionTask["status"]; count: number }>;
+  taskTrend: Array<{ date: string; count: number }>;
   channelTasks: Array<{ channel: string; count: number }>;
   channelPosts: Array<{ channel: string; count: number }>;
   channelComments: Array<{ channel: string; count: number }>;
   channelUsers: Array<{ channel: string; count: number }>;
   ipLocations: Array<{ ip_location: string; count: number }>;
+  topAuthors: Array<{ id: string; name: string; avatar?: string; count: number }>;
+  topCommenters: Array<{ id: string; name: string; avatar?: string; count: number }>;
+  recentTasks: Array<{
+    id: string;
+    keyword: string;
+    status: CollectionTask["status"];
+    message: string;
+    createdAt: string;
+  }>;
+  llmMetrics?: {
+    totalPromptTokens: number;
+    totalCompletionTokens: number;
+    totalTokens: number;
+    callCount: number;
+    avgDurationMs: number;
+    minDurationMs: number;
+    maxDurationMs: number;
+  };
 }

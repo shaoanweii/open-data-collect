@@ -7,7 +7,6 @@ import {
   CalendarDays,
   Clock3,
   FileText,
-  Lightbulb,
   Loader2,
   MessageSquareText,
   MoreHorizontal,
@@ -342,19 +341,20 @@ export function TaskQueue({
 }) {
   const [openMenuTaskId, setOpenMenuTaskId] = useState<string | null>(null);
   const [logTask, setLogTask] = useState<CollectionTask | null>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
+  // 每个 task 独立一个 ref，避免 map 中 ref 被覆盖导致菜单点击无效
+  const menuRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
   // 点击菜单外部时关闭菜单
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
-      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+      if (!openMenuTaskId) return;
+      const el = menuRefs.current.get(openMenuTaskId);
+      if (el && !el.contains(event.target as Node)) {
         setOpenMenuTaskId(null);
       }
     }
-    if (openMenuTaskId) {
-      document.addEventListener("mousedown", handleClickOutside);
-      return () => document.removeEventListener("mousedown", handleClickOutside);
-    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [openMenuTaskId]);
 
   const selectedTask = selectedTaskId ? tasks.find((task) => task.id === selectedTaskId) : null;
@@ -408,7 +408,7 @@ export function TaskQueue({
             <span>{task.channel}</span>
             <span>{formatDateTime(task.createdAt)}</span>
             <span className={`badge status-${task.status}`}>{statusText(task.status)}</span>
-            <div className="task-actions" ref={menuRef}>
+            <div className="task-actions" ref={(el) => { if (el) menuRefs.current.set(task.id, el); }}>
               <button
                 className="task-actions-trigger"
                 type="button"
@@ -419,27 +419,33 @@ export function TaskQueue({
               {openMenuTaskId === task.id && (
                 <div className="task-action-menu">
                   <button type="button" onClick={() => { onSelectTask(task.id); setOpenMenuTaskId(null); }}>
-                    查看
+                    查看详情
                   </button>
                   <button type="button" onClick={() => { setLogTask(task); setOpenMenuTaskId(null); }}>
-                    日志
+                    查看日志
                   </button>
-                  {task.status === "failed" && (
-                    <button type="button" onClick={() => { onRetry(task.id); setOpenMenuTaskId(null); }}>
-                      重试
+                  {task.status === "running" && (
+                    <button type="button" onClick={() => { onPause(task.id); setOpenMenuTaskId(null); }}>
+                      暂停采集
                     </button>
                   )}
-                  {task.status === "paused" ? (
-                    <button type="button" onClick={() => { onResume(task.id); setOpenMenuTaskId(null); }}>
-                      恢复
-                    </button>
-                  ) : (
+                  {task.status === "queued" && (
                     <button type="button" onClick={() => { onPause(task.id); setOpenMenuTaskId(null); }}>
-                      暂停
+                      取消任务
+                    </button>
+                  )}
+                  {task.status === "paused" && (
+                    <button type="button" onClick={() => { onResume(task.id); setOpenMenuTaskId(null); }}>
+                      继续采集
+                    </button>
+                  )}
+                  {(task.status === "failed" || task.status === "completed" || task.status === "running" || task.status === "queued") && (
+                    <button type="button" onClick={() => { onRetry(task.id); setOpenMenuTaskId(null); }}>
+                      重新采集
                     </button>
                   )}
                   <button className="danger" type="button" onClick={() => { onDelete(task.id); setOpenMenuTaskId(null); }}>
-                    删除
+                    删除任务
                   </button>
                 </div>
               )}
@@ -1212,13 +1218,13 @@ function UserTable({ users }: { users: StoredUser[] }) {
 // 渠道数据分析面板：渠道分布、数据量统计、IP属地分布
 // 浅色图表配色
 const CHANNEL_COLORS: Record<string, string> = {
-  "小红书": "#f472b6",
-  "抖音": "#60a5fa",
-  "汽车之家": "#34d399",
-  "懂车帝": "#a78bfa",
-  "易车网": "#fbbf24",
+  "小红书": "#2563eb",
+  "抖音": "#0ea5e9",
+  "汽车之家": "#3b82f6",
+  "懂车帝": "#64748b",
+  "易车网": "#94a3b8",
 };
-const CHANNEL_LIGHT_COLORS = ["#f472b6", "#60a5fa", "#34d399", "#a78bfa", "#fbbf24", "#38bdf8", "#fb923c", "#4ade80"];
+const CHANNEL_LIGHT_COLORS = ["#2563eb", "#0ea5e9", "#3b82f6", "#64748b", "#94a3b8", "#38bdf8", "#475569", "#60a5fa"];
 
 export function UserInsight({
   users,
@@ -1363,7 +1369,7 @@ export function UserInsight({
                   ))}
                 </Pie>
                 <Tooltip
-                  contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #dfeae5", fontSize: 12 }}
+                  contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #e4eaf2", fontSize: 12 }}
                 />
               </PieChart>
             </ResponsiveContainer>
@@ -1382,7 +1388,7 @@ export function UserInsight({
                 <XAxis dataKey="channel" tick={{ fontSize: 11 }} />
                 <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
                 <Tooltip
-                  contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #dfeae5", fontSize: 12 }}
+                  contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #e4eaf2", fontSize: 12 }}
                   formatter={(value: any) => [`${value} 条`, "帖子数"]}
                 />
                 <Bar dataKey="count" name="帖子数" radius={[6, 6, 0, 0]} maxBarSize={48}>
@@ -1407,7 +1413,7 @@ export function UserInsight({
                 <XAxis dataKey="channel" tick={{ fontSize: 11 }} />
                 <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
                 <Tooltip
-                  contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #dfeae5", fontSize: 12 }}
+                  contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #e4eaf2", fontSize: 12 }}
                   formatter={(value: any) => [`${value} 条`, "评论数"]}
                 />
                 <Bar dataKey="count" name="评论数" radius={[6, 6, 0, 0]} maxBarSize={48}>
@@ -1432,7 +1438,7 @@ export function UserInsight({
                 <XAxis dataKey="channel" tick={{ fontSize: 11 }} />
                 <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
                 <Tooltip
-                  contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #dfeae5", fontSize: 12 }}
+                  contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #e4eaf2", fontSize: 12 }}
                   formatter={(value: any) => [`${value} 人`, "用户数"]}
                 />
                 <Bar dataKey="count" name="用户数" radius={[6, 6, 0, 0]} maxBarSize={48}>
@@ -1458,7 +1464,7 @@ export function UserInsight({
               <XAxis type="number" tick={{ fontSize: 11 }} allowDecimals={false} />
               <YAxis type="category" dataKey="ip_location" tick={{ fontSize: 11 }} width={50} />
               <Tooltip
-                contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #dfeae5", fontSize: 12 }}
+                contentStyle={{ background: "rgba(255,255,255,0.95)", borderRadius: 8, border: "1px solid #e4eaf2", fontSize: 12 }}
                 formatter={(value: any) => [`${value} 人`, "用户数"]}
               />
               <Bar dataKey="count" name="用户数" radius={[0, 6, 6, 0]} maxBarSize={22} fill="#3b82f6" />
@@ -1475,10 +1481,12 @@ export function UserPool({
   users,
   posts,
   comments,
+  focusedUserId,
 }: {
   users: StoredUser[];
   posts: StoredPost[];
   comments: StoredComment[];
+  focusedUserId?: string | null;
 }) {
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [expandedSection, setExpandedSection] = useState<"posts" | "comments" | null>(null);
@@ -1550,6 +1558,25 @@ export function UserPool({
     setPage(1);
   }, [sortKey, sortDir]);
 
+  useEffect(() => {
+    if (!focusedUserId) return;
+    const userIndex = users.findIndex((user) => user.userId === focusedUserId);
+    if (userIndex < 0) return;
+
+    setSortKey(null);
+    setSortDir("desc");
+    setPage(Math.floor(userIndex / 20) + 1);
+    setExpandedUserId(focusedUserId);
+    setExpandedSection(null);
+
+    const timer = window.setTimeout(() => {
+      const row = document.getElementById(`user-pool-${focusedUserId}`);
+      row?.scrollIntoView({ block: "center", behavior: "smooth" });
+      row?.focus({ preventScroll: true });
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [focusedUserId, users]);
+
   // 分页计算
   const pageSize = 20;
   const totalPages = Math.max(1, Math.ceil(sortedUsers.length / pageSize));
@@ -1591,7 +1618,8 @@ export function UserPool({
           return (
             <div key={u.userId}>
               <div
-                className={`user-list-table-row user-pool-row ${isExpanded ? "expanded" : ""}`}
+                id={`user-pool-${u.userId}`}
+                className={`user-list-table-row user-pool-row ${isExpanded ? "expanded" : ""} ${focusedUserId === u.userId ? "focused" : ""}`}
                 onClick={() => { setExpandedUserId(isExpanded ? null : u.userId); setExpandedSection(null); }}
                 role="button"
                 tabIndex={0}
@@ -1603,7 +1631,7 @@ export function UserPool({
                     <a href={buildAuthorUrl(u.userId)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
                       <strong>{u.nickname || u.userId}</strong>
                     </a>
-                    <small style={{ color: "#8a9e97" }}>{u.redId || ""}</small>
+                    <small style={{ color: "#8a98aa" }}>{u.redId || ""}</small>
                   </div>
                 </div>
                 <span>小红书</span>
@@ -1668,7 +1696,7 @@ export function UserPool({
                     </div>
                     <div className="user-detail-item" style={{ gridColumn: "span 2" }}>
                       <span className="user-detail-label">主页链接</span>
-                      <a className="user-detail-value" href={buildAuthorUrl(u.userId)} target="_blank" rel="noreferrer" style={{ color: "var(--primary)" }}>
+                      <a className="user-detail-value" href={buildAuthorUrl(u.userId)} target="_blank" rel="noreferrer">
                         {buildAuthorUrl(u.userId)}
                       </a>
                     </div>
@@ -1733,25 +1761,6 @@ export function UserPool({
         <button type="button" disabled={safePage >= totalPages} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>
           下一页
         </button>
-      </div>
-    </section>
-  );
-}
-
-// 线索池页面骨架：后续基于用户帖子和评论进行大模型分析，判断是否可能为购车线索
-export function CluePool() {
-  return (
-    <section className="data-panel glass">
-      <div className="panel-heading">
-        <div>
-          <h3>线索池</h3>
-          <p>基于用户帖子和评论进行大模型分析，识别潜在购车线索。</p>
-        </div>
-      </div>
-      <div className="empty-state" style={{ border: "none", background: "transparent", marginTop: "40px" }}>
-        <Lightbulb size={40} />
-        <h3>功能开发中</h3>
-        <p>此页面将对接大模型服务，自动分析用户行为数据并生成购车线索。</p>
       </div>
     </section>
   );

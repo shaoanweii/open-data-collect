@@ -1,5 +1,6 @@
 import { apiClient } from "./api";
 import { persistence } from "./storage";
+import { TaskControlError, taskControl } from "./task-control";
 import type {
   CollectionTask,
   CollectOptions,
@@ -7,6 +8,7 @@ import type {
   FeedDetailData,
   QueueItem,
   SearchFilters,
+  SearchRequest,
   StoredComment,
   StoredPost,
   StoredUser,
@@ -19,6 +21,9 @@ interface CollectorCallbacks {
   onCommentsSaved: (comments: StoredComment[]) => void;
   onUserSaved: (user: StoredUser) => void;
 }
+
+const FEED_DETAIL_MAX_ATTEMPTS = 3;
+const FEED_DETAIL_RETRY_DELAY_MS = 2000;
 
 export async function runCollectionTask(
   keyword: string,
@@ -58,10 +63,12 @@ export async function runCollectionTask(
   } else {
     task = createTask(keyword, channel, filters, options);
   }
+  const taskSignal = taskControl.begin(task.id);
   callbacks.onTaskUpdate(task);
   await persistence.saveTask(task);
 
   try {
+    taskControl.assertActive(task.id, taskSignal);
     task = patchTask(task, {
       status: "running",
       startedAt: new Date().toISOString(),
@@ -70,26 +77,47 @@ export async function runCollectionTask(
     task = addLog(task, "task", "任务启动", "准备采集环境");
     callbacks.onTaskUpdate(task);
 
-    const login = await apiClient.checkLoginStatus();
+    const login = await apiClient.checkLoginStatus({
+      signal: taskSignal,
+      _timeout: 15000,
+      _timeoutMessage:
+        "采集服务浏览器链路 15 秒无响应，请重启 xiaohongshu-mcp；如需看到浏览器窗口，请用 -headless=false 启动采集服务",
+    });
+    taskControl.assertActive(task.id, taskSignal);
     if (!login.is_logged_in) {
       throw new Error("当前采集账号未登录，请先在采集服务中完成登录后重试");
     }
 
     task = patchTask(task, { message: "正在查询主贴数量" });
-    const searchRequest = {
+    // 去掉默认筛选条件，避免 MCP 浏览器点击交互失败
+    const cleanFilters: Record<string, string> = {};
+    if (filters.sort_by !== "综合") cleanFilters.sort_by = filters.sort_by;
+    if (filters.location !== "不限") cleanFilters.location = filters.location;
+    if (filters.publish_time !== "不限") cleanFilters.publish_time = filters.publish_time;
+    if (filters.note_type !== "不限") cleanFilters.note_type = filters.note_type;
+    if (filters.search_scope !== "不限") cleanFilters.search_scope = filters.search_scope;
+    const searchRequest: Record<string, unknown> = {
       keyword,
-      filters,
+      ...(Object.keys(cleanFilters).length > 0 ? { filters: cleanFilters } : {}),
       ...(options.searchLimit ? { limit: options.searchLimit } : {}),
     };
     task = addLog(task, "search", "搜索请求", "POST /api/v1/analysis/search", searchRequest);
     callbacks.onTaskUpdate(task);
 
-    const search = await apiClient.searchFeeds(searchRequest);
+    const search = await apiClient.searchFeeds(searchRequest as unknown as SearchRequest, { signal: taskSignal });
+    taskControl.assertActive(task.id, taskSignal);
+    // 通过 noteCard 和 id/xsecToken 判断有效帖子，不依赖 modelType（可能随时间变化）
     const items = search.feeds
-      .filter((item) => item.modelType === "note" && item.id && item.xsecToken)
+      .filter((item) => {
+        const noteCard = item.noteCard as Record<string, unknown> | undefined;
+        const hasNoteCard = noteCard && (noteCard.displayTitle || noteCard.title || noteCard.desc);
+        const id = item.id;
+        const xsecToken = item.xsecToken || item.xsec_token;
+        return hasNoteCard && id && xsecToken;
+      })
       .map<QueueItem>((item) => ({
         feedId: item.id ?? "",
-        xsecToken: item.xsecToken ?? "",
+        xsecToken: item.xsecToken || item.xsec_token || "",
         title: item.noteCard?.displayTitle || "未命名帖子",
         authorName: item.noteCard?.user?.nickname || item.noteCard?.user?.nickName || "未知作者",
         authorId: item.noteCard?.user?.userId,
@@ -120,10 +148,31 @@ export async function runCollectionTask(
       return task;
     }
 
+    // 逐条采集，并在每次循环前检查是否被暂停
     for (const item of items) {
-      task = await processItem(task, item.feedId, options, callbacks);
+      taskControl.assertActive(task.id, taskSignal);
+      // 检查任务是否被用户暂停
+      const currentCache = persistence.loadCache();
+      const currentTask = currentCache.tasks.find((t) => t.id === task.id);
+      if (currentTask?.status === "paused") {
+        // 将剩余未处理条目标记为 queued，任务标记为 paused 退出
+        for (const remaining of items.slice(items.indexOf(item))) {
+          task = updateItem(task, remaining.feedId, { status: "queued" });
+        }
+        task = patchTask(task, {
+          status: "paused",
+          message: `任务已暂停，剩余 ${items.length - items.indexOf(item)} 条待处理`,
+        });
+        task = addLog(task, "task", "任务暂停", `用户暂停，剩余 ${items.length - items.indexOf(item)} 条未处理`);
+        callbacks.onTaskUpdate(task);
+        await persistence.saveTask(task);
+        return task;
+      }
+
+      task = await processItem(task, item.feedId, options, callbacks, taskSignal);
+      taskControl.assertActive(task.id, taskSignal);
       if (options.requestDelayMs > 0) {
-        await sleep(options.requestDelayMs);
+        await sleep(options.requestDelayMs, taskSignal, task.id);
       }
     }
 
@@ -141,8 +190,25 @@ export async function runCollectionTask(
     );
     callbacks.onTaskUpdate(task);
     await persistence.saveTask(task);
+    taskControl.complete(task.id);
     return task;
   } catch (error) {
+    if (error instanceof TaskControlError) {
+      if (error.action === "deleted") {
+        taskControl.complete(task.id);
+        return patchTask(task, { status: "paused", message: "任务已删除" });
+      }
+
+      task = patchTask(task, {
+        status: "paused",
+        message: "任务已暂停",
+      });
+      task = addLog(task, "task", "任务暂停", "用户暂停任务，已停止当前采集流程");
+      callbacks.onTaskUpdate(task);
+      await persistence.saveTask(task);
+      return task;
+    }
+
     task = patchTask(task, {
       status: "failed",
       finishedAt: new Date().toISOString(),
@@ -152,6 +218,7 @@ export async function runCollectionTask(
     task = addLog(task, "error", "任务失败", errorToMessage(error));
     callbacks.onTaskUpdate(task);
     await persistence.saveTask(task);
+    taskControl.complete(task.id);
     return task;
   }
 }
@@ -179,7 +246,9 @@ export async function retryCollectionItem(task: CollectionTask, feedId: string, 
   callbacks.onTaskUpdate(nextTask);
   await persistence.saveTask(nextTask);
 
-  const result = await processItem(nextTask, feedId, nextTask.options, callbacks);
+  taskControl.begin(nextTask.id);
+  const retrySignal = taskControl.signal(nextTask.id);
+  const result = await processItem(nextTask, feedId, nextTask.options, callbacks, retrySignal);
 
   // 重采集完成后，若所有条目均已处理完毕则标记为已完成
   const allDone = result.items.every(
@@ -189,9 +258,11 @@ export async function retryCollectionItem(task: CollectionTask, feedId: string, 
     const finalTask = patchTask(result, { status: "completed" });
     callbacks.onTaskUpdate(finalTask);
     await persistence.saveTask(finalTask);
+    taskControl.complete(finalTask.id);
     return finalTask;
   }
 
+  taskControl.complete(result.id);
   return result;
 }
 
@@ -228,7 +299,9 @@ async function processItem(
   feedId: string,
   options: CollectOptions,
   callbacks: CollectorCallbacks,
+  signal?: AbortSignal,
 ) {
+  taskControl.assertActive(task.id, signal);
   let nextTask = updateItem(task, feedId, { status: "fetching" });
   const currentIndex = nextTask.completed + nextTask.failed + 1;
   nextTask = patchTask(nextTask, {
@@ -243,6 +316,7 @@ async function processItem(
   }
 
   try {
+    taskControl.assertActive(nextTask.id, signal);
     const detailRequest = {
       feed_id: queueItem.feedId,
       xsec_token: queueItem.xsecToken,
@@ -252,7 +326,17 @@ async function processItem(
     nextTask = addLog(nextTask, "post", "主贴详情请求", `第 ${currentIndex} 条主贴详情请求`, detailRequest);
     callbacks.onTaskUpdate(nextTask);
 
-    const detail = await apiClient.getFeedDetail(detailRequest);
+    const retryResult = await requestFeedDetailWithRetry(
+      nextTask,
+      detailRequest,
+      currentIndex,
+      queueItem,
+      callbacks,
+      signal,
+    );
+    nextTask = retryResult.task;
+    const detail = retryResult.detail;
+    taskControl.assertActive(nextTask.id, signal);
 
     const post = toStoredPost(nextTask.id, detail, queueItem);
     const comments = toStoredComments(nextTask.id, detail);
@@ -268,7 +352,8 @@ async function processItem(
           message: `本次查询到 ${nextTask.total} 条主贴，正在整理第 ${currentIndex} 条主贴的第 ${commentIndex} 个评论 / 共 ${comments.length} 个评论`,
         });
         callbacks.onTaskUpdate(nextTask);
-        await sleep(0);
+        await sleep(0, signal, nextTask.id);
+        taskControl.assertActive(nextTask.id, signal);
       }
       nextTask = addLog(
         nextTask,
@@ -285,6 +370,7 @@ async function processItem(
     if (options.includeUserProfiles) {
       const users = collectUserProfileTargets(detail, queueItem).slice(0, 12);
       for (const [index, target] of users.entries()) {
+        taskControl.assertActive(nextTask.id, signal);
         nextTask = patchTask(nextTask, {
           message: `本次查询到 ${nextTask.total} 条主贴，正在读取第 ${currentIndex} 条主贴的第 ${
             index + 1
@@ -300,10 +386,14 @@ async function processItem(
           nextTask = addLog(nextTask, "user", "用户资料请求", `第 ${index + 1} 个用户资料请求：${target.userId}`, profileRequest);
           callbacks.onTaskUpdate(nextTask);
 
-          const profile = await apiClient.getUserProfile({
-            user_id: target.userId,
-            xsec_token: target.xsecToken,
-          });
+          const profile = await apiClient.getUserProfile(
+            {
+              user_id: target.userId,
+              xsec_token: target.xsecToken,
+            },
+            { signal },
+          );
+          taskControl.assertActive(nextTask.id, signal);
           const user = toStoredUser(nextTask.id, target.userId, profile);
           await persistence.saveUser(user);
           callbacks.onUserSaved(user);
@@ -328,6 +418,10 @@ async function processItem(
             } 条`,
     });
   } catch (error) {
+    if (error instanceof TaskControlError) {
+      throw error;
+    }
+
     const message = errorToMessage(error);
     nextTask = updateItem(nextTask, feedId, {
       status: "failed",
@@ -376,6 +470,99 @@ function updateItem(task: CollectionTask, feedId: string, patch: Partial<QueueIt
     ...task,
     items: task.items.map((item) => (item.feedId === feedId ? { ...item, ...patch } : item)),
   };
+}
+
+async function requestFeedDetailWithRetry(
+  task: CollectionTask,
+  detailRequest: {
+    feed_id: string;
+    xsec_token: string;
+    load_all_comments: boolean;
+    comment_config: CollectOptions["commentConfig"];
+  },
+  currentIndex: number,
+  queueItem: QueueItem,
+  callbacks: CollectorCallbacks,
+  signal?: AbortSignal,
+) {
+  let nextTask = task;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= FEED_DETAIL_MAX_ATTEMPTS; attempt += 1) {
+    taskControl.assertActive(nextTask.id, signal);
+    if (attempt > 1) {
+      nextTask = patchTask(nextTask, {
+        message: `第 ${currentIndex} 条主贴读取失败，正在第 ${attempt} 次重试`,
+      });
+      nextTask = addLog(
+        nextTask,
+        "post",
+        "主贴详情重试",
+        `第 ${currentIndex} 条主贴第 ${attempt} 次重试：${queueItem.title || queueItem.feedId}`,
+        {
+          attempt,
+          maxAttempts: FEED_DETAIL_MAX_ATTEMPTS,
+          retryDelayMs: FEED_DETAIL_RETRY_DELAY_MS,
+          feedId: queueItem.feedId,
+        },
+      );
+      callbacks.onTaskUpdate(nextTask);
+      await persistence.saveTask(nextTask);
+    }
+
+    try {
+      const detail = await apiClient.getFeedDetail(detailRequest, { signal });
+      taskControl.assertActive(nextTask.id, signal);
+      if (attempt > 1) {
+        nextTask = addLog(
+          nextTask,
+          "post",
+          "主贴详情重试成功",
+          `第 ${currentIndex} 条主贴第 ${attempt} 次重试成功：${queueItem.title || queueItem.feedId}`,
+          { attempt, feedId: queueItem.feedId },
+        );
+        callbacks.onTaskUpdate(nextTask);
+        await persistence.saveTask(nextTask);
+      }
+      return { task: nextTask, detail };
+    } catch (error) {
+      try {
+        taskControl.assertActive(nextTask.id, signal);
+      } catch (controlError) {
+        throw controlError;
+      }
+
+      lastError = error;
+      if (attempt >= FEED_DETAIL_MAX_ATTEMPTS) {
+        break;
+      }
+
+      const message = errorToMessage(error);
+      taskControl.assertActive(nextTask.id, signal);
+      nextTask = patchTask(nextTask, {
+        message: `第 ${currentIndex} 条主贴读取失败，2 秒后自动重试第 ${attempt + 1} 次`,
+      });
+      nextTask = addLog(
+        nextTask,
+        "error",
+        "主贴详情请求失败",
+        `第 ${currentIndex} 条主贴第 ${attempt} 次失败，2 秒后自动重试：${message}`,
+        {
+          attempt,
+          nextAttempt: attempt + 1,
+          maxAttempts: FEED_DETAIL_MAX_ATTEMPTS,
+          retryDelayMs: FEED_DETAIL_RETRY_DELAY_MS,
+          feedId: queueItem.feedId,
+          error: message,
+        },
+      );
+      callbacks.onTaskUpdate(nextTask);
+      await persistence.saveTask(nextTask);
+      await sleep(FEED_DETAIL_RETRY_DELAY_MS, signal, nextTask.id);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(errorToMessage(lastError));
 }
 
 function toStoredPost(taskId: string, detail: FeedDetailData, queueItem: QueueItem): StoredPost {
@@ -559,8 +746,36 @@ function extractAvatarUrl(value: ProfileImageValue) {
   return undefined;
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal, taskId?: string) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      try {
+        if (taskId) {
+          taskControl.assertActive(taskId, signal);
+        }
+        reject(new TaskControlError("paused"));
+      } catch (error) {
+        reject(error);
+      }
+      return;
+    }
+    const timer = window.setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        window.clearTimeout(timer);
+        try {
+          if (taskId) {
+            taskControl.assertActive(taskId, signal);
+          }
+          reject(new TaskControlError("paused"));
+        } catch (error) {
+          reject(error);
+        }
+      },
+      { once: true },
+    );
+  });
 }
 
 function getProgressCheckpoints(total: number) {
