@@ -29,6 +29,7 @@ type TimeValue = string | number;
 type LeadFilter = "all" | "pending" | "frequent";
 type LeadSort = "activity" | "recent";
 type Rating = "high" | "medium" | "low" | "none";
+type LeadStatusFilter = Rating | "pending";
 
 type LeadComment = {
   commentId: string;
@@ -78,6 +79,8 @@ type LeadCandidate = {
   ipLocation?: string;
   redId?: string;
   desc?: string;
+  sourceChannels?: string[];
+  sourceSubChannels?: string[];
   postCount: number;
   commentCount: number;
   activityCount: number;
@@ -90,6 +93,13 @@ type LeadCandidate = {
 };
 
 type ScopeTask = { id: string; keyword: string; channel: string; status: string; createdAt: string };
+const STATUS_FILTER_OPTIONS: Array<{ value: LeadStatusFilter; label: string }> = [
+  { value: "pending", label: "待评级" },
+  { value: "high", label: "高价值" },
+  { value: "medium", label: "中意向" },
+  { value: "low", label: "低意向" },
+  { value: "none", label: "无价值" },
+];
 type AnalysisJob = {
   id: string;
   taskId?: string;
@@ -112,6 +122,7 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
   // 分析范围：只有「开始全量评级」时提交，不触发页面查询
   const [analyzeScope, setAnalyzeScope] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<LeadFilter>("all");
+  const [statusFilters, setStatusFilters] = useState<Set<LeadStatusFilter>>(new Set());
   const [sort, setSort] = useState<LeadSort>("activity");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -120,7 +131,10 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
   const [job, setJob] = useState<AnalysisJob | null>(null);
   // 任务下拉菜单状态
   const [tasksOpen, setTasksOpen] = useState(false);
+  const [statusFilterOpen, setStatusFilterOpen] = useState(false);
   const tasksDropdownRef = useRef<HTMLDivElement>(null);
+  const statusDropdownRef = useRef<HTMLSpanElement>(null);
+  const mainGridRef = useRef<HTMLDivElement>(null);
   // 批量选择模式
   const [batchMode, setBatchMode] = useState(false);
   const [batchSelected, setBatchSelected] = useState<Set<string>>(new Set());
@@ -140,6 +154,17 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, [tasksOpen, closeDropdown]);
+
+  useEffect(() => {
+    if (!statusFilterOpen) return;
+    function handler(e: MouseEvent) {
+      if (statusDropdownRef.current && !statusDropdownRef.current.contains(e.target as Node)) {
+        setStatusFilterOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [statusFilterOpen]);
 
   // 分析范围切换（不触发页面查询）
   function toggleAnalyzeScope(id: string) {
@@ -181,6 +206,38 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
     if (batchSelected.size === 0) return;
     batchActiveRef.current = true;
     void requestAnalysis([...batchSelected]);
+  }
+  function toggleStatusFilter(value: LeadStatusFilter) {
+    setStatusFilters((prev) => {
+      const next = new Set(prev);
+      if (next.has(value)) {
+        next.delete(value);
+      } else {
+        next.add(value);
+      }
+      return next;
+    });
+  }
+  function clearStatusFilters() {
+    setStatusFilters(new Set());
+  }
+  function selectVisiblePendingForBatch() {
+    const pendingIds = visibleCandidates
+      .filter((candidate) => !candidate.analysis)
+      .map((candidate) => candidate.id);
+    if (!pendingIds.length) return;
+    setBatchMode(true);
+    setBatchSelected(new Set(pendingIds));
+    setStatusFilterOpen(false);
+  }
+  function selectFrequentUser(candidateId: string) {
+    setFilter("all");
+    setStatusFilters(new Set());
+    setQuery("");
+    setSelectedId(candidateId);
+    window.requestAnimationFrame(() => {
+      mainGridRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+    });
   }
 
   const selectedTasksLabel = useMemo(() => {
@@ -244,6 +301,7 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
       .filter((candidate) => {
         if (filter === "pending" && candidate.analysis) return false;
         if (filter === "frequent" && candidate.activityCount < 3) return false;
+        if (statusFilters.size > 0 && !statusFilters.has(candidateStatus(candidate))) return false;
         if (!keyword) return true;
         return [candidate.name, candidate.id, candidate.redId, candidate.ipLocation]
           .filter(Boolean)
@@ -252,7 +310,7 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
       .sort((a, b) => sort === "activity"
         ? b.activityCount - a.activityCount
         : dateValue(b.latestAt) - dateValue(a.latestAt));
-  }, [candidates, filter, query, sort]);
+  }, [candidates, filter, query, sort, statusFilters]);
 
   useEffect(() => {
     if (!visibleCandidates.length) {
@@ -274,6 +332,11 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
   const ratedCount = candidates.filter((candidate) => candidate.analysis).length;
   const pendingCount = candidates.length - ratedCount;
   const isAnalyzing = job ? ["queued", "running"].includes(job.status) : false;
+  const statusFilterLabel = statusFilters.size === 0
+    ? "状态"
+    : statusFilters.size === 1
+      ? statusLabel([...statusFilters][0] as LeadStatusFilter)
+      : `状态 ${statusFilters.size}`;
 
   async function requestAnalysis(userIds: string[] = []) {
     setError("");
@@ -348,7 +411,7 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
           </div>
           <button className="clue-analyze-button" type="button" disabled={isAnalyzing || !candidates.length} onClick={() => void requestAnalysis()}>
             {isAnalyzing ? <RefreshCw size={17} className="spin" /> : <BrainCircuit size={17} />}
-            {isAnalyzing ? "评级进行中" : "开始全量评级"}
+            {isAnalyzing ? "评级进行中" : analyzeScope.size === 0 ? "开始全量评级" : analyzeScope.size === 1 ? "开始 1 个任务评级" : `开始 ${analyzeScope.size} 个任务评级`}
           </button>
         </div>
       </header>
@@ -368,12 +431,13 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
           <div><h2>高频发评用户排行榜</h2><p>按评论次数排序，展示最近一次发评动态</p></div>
           <span className="clue-ranking-total">TOP {frequentUsers.length}</span>
         </div>
-        <div className="clue-frequency-head"><span>名次</span><span>用户</span><span>评论数</span><span>发帖数</span><span>最近发评</span></div>
+        <div className="clue-frequency-head"><span>名次</span><span>用户</span><span>渠道来源</span><span>评论数</span><span>发帖数</span><span>最近发评</span></div>
         <div className="clue-frequency-list">
           {frequentUsers.map((candidate, index) => (
-            <button className={candidate.id === selectedId ? "active" : ""} type="button" key={candidate.id} onClick={() => setSelectedId(candidate.id)}>
+            <button className={candidate.id === selectedId ? "active" : ""} type="button" key={candidate.id} onClick={() => selectFrequentUser(candidate.id)}>
               <span className={`clue-rank rank-${index + 1}`}>{String(index + 1).padStart(2, "0")}</span>
               <span className="clue-frequency-user"><LeadAvatar lead={candidate} /><span className="clue-frequency-name"><strong>{candidate.name}</strong><small>{candidate.ipLocation || "IP 未知"}</small></span></span>
+              <span className="clue-source-channel" title={formatSourceChannels(candidate.sourceChannels, candidate.sourceSubChannels)}>{formatSourceChannels(candidate.sourceChannels, candidate.sourceSubChannels)}</span>
               <span className="clue-frequency-count"><strong>{candidate.commentCount}</strong> 条</span>
               <span className="clue-frequency-posts">{candidate.postCount} 篇</span>
               <span className="clue-frequency-latest"><strong>{formatShortDate(candidate.latestComment?.createTime)}</strong><small>{candidate.latestComment?.content || "无文本内容"}</small></span>
@@ -414,7 +478,7 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
         </div>
       </div>
 
-      <div className="clue-main-grid">
+      <div className="clue-main-grid" ref={mainGridRef}>
         <section className="clue-queue-panel">
           {batchMode && (
             <div className="clue-batch-bar">
@@ -436,7 +500,31 @@ export function CluePoolPage({ onOpenUser, onNavigateToPost }: {
           )}
           <div className={`clue-queue-head${batchMode ? " batch" : ""}`}>
             {batchMode && <span className="clue-queue-check" />}
-            <span>用户</span><span>行为</span><span>最近互动</span><span>状态</span>
+            <span>用户</span><span>行为</span><span>最近互动</span>
+            <span className="clue-status-filter" ref={statusDropdownRef}>
+              <button
+                className={statusFilters.size > 0 ? "active" : ""}
+                type="button"
+                onClick={() => setStatusFilterOpen((value) => !value)}
+              >
+                {statusFilterLabel}
+                <ChevronDown size={12} />
+              </button>
+              {statusFilterOpen && (
+                <div className="clue-status-filter-menu">
+                  {STATUS_FILTER_OPTIONS.map((item) => (
+                    <button key={item.value} type="button" onClick={() => toggleStatusFilter(item.value)}>
+                      {statusFilters.has(item.value) ? <CheckSquare size={14} /> : <Square size={14} />}
+                      {item.label}
+                    </button>
+                  ))}
+                  <div className="clue-status-filter-actions">
+                    <button type="button" onClick={clearStatusFilters}>清除筛选</button>
+                    <button type="button" className="primary" onClick={selectVisiblePendingForBatch}>勾选全部未评级</button>
+                  </div>
+                </div>
+              )}
+            </span>
           </div>
           <div className={`clue-queue-list${batchMode ? " batch" : ""}`}>
             {visibleCandidates.map((candidate) => {
@@ -626,7 +714,7 @@ function LeadDetail({ lead, onOpenUser, onReevaluate, disabled, analyzingThis, o
               <><RefreshCw size={16} /> {lead.analysis ? "重新评级" : "评级"}</>
             )}
           </button>
-        <button type="button" disabled title="等待孵化线索池"><UserPlus size={16} />转入孵化池</button>
+        <button type="button" disabled title="等待建档线索池"><UserPlus size={16} />转入建档</button>
         <button className="clue-log-button" type="button" onClick={() => setLogOpen(true)}>
           <FileText size={14} /> 查看log
         </button>
@@ -753,6 +841,19 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
 
 function ratingLabel(rating?: Rating) {
   return rating === "high" ? "高价值" : rating === "medium" ? "中意向" : rating === "low" ? "低意向" : rating === "none" ? "无价值" : "待评级";
+}
+
+function statusLabel(status: LeadStatusFilter) {
+  return status === "pending" ? "待评级" : ratingLabel(status);
+}
+
+function candidateStatus(candidate: LeadCandidate): LeadStatusFilter {
+  return candidate.analysis?.rating || "pending";
+}
+
+function formatSourceChannels(channels?: string[], subChannels?: string[]) {
+  const primary = channels?.length ? channels.join("、") : "未知";
+  return subChannels?.length ? `${primary} / ${subChannels.join("、")}` : primary;
 }
 
 function joinValues(values?: string[]) {

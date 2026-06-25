@@ -279,6 +279,8 @@ export interface CollectionTask {
 export interface StoredPost {
   taskId: string;
   feedId: string;
+  sourceChannel?: string;
+  sourceSubChannel?: string;
   title?: string;
   desc?: string;
   authorId?: string;
@@ -296,6 +298,8 @@ export interface StoredPost {
 export interface StoredComment {
   taskId: string;
   feedId: string;
+  sourceChannel?: string;
+  sourceSubChannel?: string;
   commentId: string;
   parentCommentId?: string;
   userId?: string;
@@ -312,6 +316,8 @@ export interface StoredComment {
 export interface StoredUser {
   taskId: string;
   userId: string;
+  sourceChannel?: string;
+  sourceSubChannel?: string;
   nickname?: string;
   avatar?: string;
   gender?: number;

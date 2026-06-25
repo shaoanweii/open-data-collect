@@ -27,6 +27,7 @@ import {
   YAxis,
 } from "recharts";
 import { formatCount } from "../../lib/format";
+import { DateRangeFilter } from "../../components/page-shared";
 import type { AnalyticsData, CollectionTask } from "../../types";
 
 const API_BASE_URL = import.meta.env.VITE_STORAGE_API_BASE_URL || "http://127.0.0.1:5174";
@@ -166,30 +167,12 @@ export function SystemSettingsPage({ onOpenTask, onOpenTaskList, onOpenComments,
             </div>
           </div>
         </div>
-        <div className="audit-date-filter">
-          <label className="audit-date-label">
-            <span>起始</span>
-            <input
-              type="date"
-              className="audit-date-input"
-              value={startDate}
-              max={endDate}
-              onChange={(e) => setStartDate(e.target.value)}
-            />
-          </label>
-          <span className="audit-date-sep">—</span>
-          <label className="audit-date-label">
-            <span>截止</span>
-            <input
-              type="date"
-              className="audit-date-input"
-              value={endDate}
-              min={startDate}
-              max={new Date().toISOString().slice(0, 10)}
-              onChange={(e) => setEndDate(e.target.value)}
-            />
-          </label>
-        </div>
+        <DateRangeFilter
+          dateFrom={startDate}
+          dateTo={endDate}
+          onChangeFrom={setStartDate}
+          onChangeTo={setEndDate}
+        />
         <div className="audit-header-actions">
           <span className="audit-updated">更新于 {formatClock(lastUpdated)}</span>
           <button

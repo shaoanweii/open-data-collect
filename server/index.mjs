@@ -7,9 +7,12 @@ import {
   getClueAnalysisJob,
   getClueCandidates,
   getClueScopes,
+  getIncubationLeads,
+  getIncubationDetail,
   getLatestClueResults,
   getLlmMetrics,
   startClueAnalysis,
+  updateIncubationLead,
 } from "./clue-analysis.mjs";
 
 loadLocalEnv();
@@ -143,6 +146,27 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    // 孵化池：已评级线索列表
+    if (request.method === "GET" && url.pathname === "/api/clues/incubation") {
+      sendJson(response, { leads: await getIncubationLeads(pool) });
+      return;
+    }
+
+    // 孵化池：更新单个线索跟进状态
+    if (request.method === "PATCH" && url.pathname.startsWith("/api/clues/incubation/")) {
+      const userId = decodeURIComponent(url.pathname.replace("/api/clues/incubation/", ""));
+      const payload = await readJson(request);
+      sendJson(response, { followUp: await updateIncubationLead(pool, userId, payload) });
+      return;
+    }
+
+    // 孵化池：单个线索 360° 详情
+    if (request.method === "GET" && url.pathname.startsWith("/api/clues/incubation/")) {
+      const userId = decodeURIComponent(url.pathname.replace("/api/clues/incubation/", ""));
+      sendJson(response, await getIncubationDetail(pool, userId));
+      return;
+    }
+
     sendJson(response, { error: "Not found" }, 404);
   } catch (error) {
     sendJson(response, {
@@ -243,11 +267,11 @@ async function fetchAnalytics(startDate = "", endDate = "") {
     pool.query(`SELECT source_channel as channel, COUNT(*)::int as count FROM open_post ${relatedDateFilter} GROUP BY source_channel ORDER BY count DESC`, params),
     // 渠道评论数分布
     pool.query(`
-      SELECT COALESCE(p.source_channel, '未知') as channel, COUNT(*)::int as count
+      SELECT COALESCE(c.source_channel, p.source_channel, '未知') as channel, COUNT(*)::int as count
       FROM open_comment c
       LEFT JOIN open_post p ON c.task_id = p.task_id AND c.feed_id = p.feed_id
       ${relatedDateFilter ? `WHERE c.task_id IN (SELECT id FROM open_collection_task WHERE 1=1 ${taskDateFilter})` : ""}
-      GROUP BY p.source_channel
+      GROUP BY COALESCE(c.source_channel, p.source_channel, '未知')
       ORDER BY count DESC
     `, params),
     // 渠道用户数分布
@@ -427,15 +451,17 @@ async function saveTaskItem(taskId, item) {
 async function savePostShell(taskId, item) {
   await pool.query(
     `insert into open_post (
-      task_id, feed_id, source_channel, collect_status, error_message, xsec_token,
+      task_id, feed_id, source_channel, source_sub_channel, collect_status, error_message, xsec_token,
       title, post_url, author_user_id, author_nickname, author_profile_url,
       search_payload, raw_payload
     ) values (
-      $1, $2, '小红书', $3, $4, $5,
-      $6, $7, $8, $9, $10,
-      $11::jsonb, $12::jsonb
+      $1, $2, $3, $4, $5, $6, $7,
+      $8, $9, $10, $11, $12,
+      $13::jsonb, $14::jsonb
     )
     on conflict (task_id, feed_id) do update set
+      source_channel = coalesce(excluded.source_channel, open_post.source_channel),
+      source_sub_channel = coalesce(excluded.source_sub_channel, open_post.source_sub_channel),
       collect_status = case
         when open_post.collect_status = '成功' and excluded.collect_status <> '失败' then open_post.collect_status
         else excluded.collect_status
@@ -451,6 +477,8 @@ async function savePostShell(taskId, item) {
     [
       taskId,
       item.feedId,
+      item.sourceChannel || "小红书",
+      item.sourceSubChannel || "搜索列表",
       collectStatusText(item.status),
       item.error,
       item.xsecToken,
@@ -542,17 +570,19 @@ async function savePost(post) {
 
   await pool.query(
     `insert into open_post (
-      task_id, feed_id, source_channel, collect_status, xsec_token, title,
+      task_id, feed_id, source_channel, source_sub_channel, collect_status, xsec_token, title,
       description, post_url, author_user_id, author_nickname, author_avatar,
       author_profile_url, liked_count_text, shared_count_text, comment_count_text,
       collected_count_text, ip_location, publish_time_ms, publish_time, search_payload, raw_payload
     ) values (
-      $1, $2, '小红书', '成功', $3, $4,
-      $5, $6, $7, $8, $9,
-      $10, $11, $12, $13,
-      $14, $15, $16, $17, $18::jsonb, $19::jsonb
+      $1, $2, $3, $4, '成功', $5, $6,
+      $7, $8, $9, $10, $11,
+      $12, $13, $14, $15,
+      $16, $17, $18, $19, $20::jsonb, $21::jsonb
     )
     on conflict (task_id, feed_id) do update set
+      source_channel = excluded.source_channel,
+      source_sub_channel = excluded.source_sub_channel,
       collect_status = '成功',
       error_message = null,
       xsec_token = excluded.xsec_token,
@@ -575,6 +605,8 @@ async function savePost(post) {
     [
       post.taskId,
       post.feedId,
+      post.sourceChannel || "小红书",
+      post.sourceSubChannel || "主贴详情",
       post.xsecToken,
       post.title,
       post.desc,
@@ -607,17 +639,21 @@ async function saveComments(comments) {
     );
     await pool.query(
       `insert into open_comment (
-        task_id, feed_id, comment_id, parent_comment_id, comment_level, content,
+        task_id, feed_id, source_channel, source_sub_channel, comment_id, parent_comment_id, comment_level, content,
         user_id, xsec_token, nickname, avatar, like_count_text, ip_location,
         comment_time_ms, comment_time, raw_payload
       ) values (
-        $1, $2, $3, $4, $5, $6,
-        $7, $8, $9, $10, $11, $12,
-        $13, $14, $15::jsonb
+        $1, $2,
+        COALESCE($3, (SELECT p.source_channel FROM open_post p WHERE p.task_id = $1 AND p.feed_id = $2 LIMIT 1), (SELECT t.channel FROM open_collection_task t WHERE t.id = $1 LIMIT 1), '小红书'),
+        $4, $5, $6, $7, $8,
+        $9, $10, $11, $12, $13, $14,
+        $15, $16, $17::jsonb
       )`,
       [
         comment.taskId,
         comment.feedId,
+        comment.sourceChannel || null,
+        comment.sourceSubChannel || "评论区",
         comment.commentId,
         comment.parentCommentId,
         comment.parentCommentId ? 2 : 1,
@@ -643,15 +679,17 @@ async function saveUser(user) {
 
   await pool.query(
     `insert into open_user_profile (
-      task_id, user_id, source_channel, nickname, red_id, gender, ip_location,
+      task_id, user_id, source_channel, source_sub_channel, nickname, red_id, gender, ip_location,
       description, avatar, profile_url, fans_count_text, follows_count_text,
       liked_and_collected_count_text, interactions, raw_payload
     ) values (
-      $1, $2, '小红书', $3, $4, $5, $6,
-      $7, $8, $9, $10, $11,
-      $12, $13::jsonb, $14::jsonb
+      $1, $2, $3, $4, $5, $6, $7, $8,
+      $9, $10, $11, $12, $13,
+      $14, $15::jsonb, $16::jsonb
     )
     on conflict (task_id, user_id) do update set
+      source_channel = excluded.source_channel,
+      source_sub_channel = excluded.source_sub_channel,
       nickname = excluded.nickname,
       red_id = excluded.red_id,
       gender = excluded.gender,
@@ -667,6 +705,8 @@ async function saveUser(user) {
     [
       user.taskId,
       user.userId,
+      user.sourceChannel || "小红书",
+      user.sourceSubChannel || "用户主页",
       user.nickname,
       user.redId,
       user.gender,

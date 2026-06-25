@@ -60,6 +60,70 @@ export async function ensureClueAnalysisSchema(pool) {
     CREATE INDEX IF NOT EXISTS idx_open_clue_result_scope ON open_clue_analysis_result(scope_task_id, created_at DESC);
   `);
 
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF to_regclass('open_comment') IS NOT NULL THEN
+        ALTER TABLE open_comment ADD COLUMN IF NOT EXISTS source_channel text;
+        ALTER TABLE open_comment ADD COLUMN IF NOT EXISTS source_sub_channel text;
+      END IF;
+      IF to_regclass('open_post') IS NOT NULL THEN
+        ALTER TABLE open_post ADD COLUMN IF NOT EXISTS source_channel text;
+        ALTER TABLE open_post ADD COLUMN IF NOT EXISTS source_sub_channel text;
+      END IF;
+      IF to_regclass('open_user_profile') IS NOT NULL THEN
+        ALTER TABLE open_user_profile ADD COLUMN IF NOT EXISTS source_channel text;
+        ALTER TABLE open_user_profile ADD COLUMN IF NOT EXISTS source_sub_channel text;
+      END IF;
+    END $$;
+  `);
+
+  await pool.query(`
+    UPDATE open_post p
+    SET source_channel = NULLIF(t.channel, '')
+    FROM open_collection_task t
+    WHERE p.task_id = t.id
+      AND (p.source_channel IS NULL OR p.source_channel = '' OR p.source_channel = '未知')
+      AND NULLIF(t.channel, '') IS NOT NULL
+  `).catch(() => {
+    // 基础采集表不存在或旧库字段未就绪时跳过，服务下次启动会继续迁移。
+  });
+
+  await pool.query(`
+    UPDATE open_user_profile u
+    SET source_channel = NULLIF(t.channel, '')
+    FROM open_collection_task t
+    WHERE u.task_id = t.id
+      AND (u.source_channel IS NULL OR u.source_channel = '' OR u.source_channel = '未知')
+      AND NULLIF(t.channel, '') IS NOT NULL
+  `).catch(() => {
+    // 基础采集表不存在或旧库字段未就绪时跳过，服务下次启动会继续迁移。
+  });
+
+  await pool.query(`
+    UPDATE open_comment c
+    SET source_channel = COALESCE(
+      NULLIF(c.source_channel, ''),
+      (SELECT p.source_channel FROM open_post p WHERE p.task_id = c.task_id AND p.feed_id = c.feed_id LIMIT 1),
+      (SELECT NULLIF(t.channel, '') FROM open_collection_task t WHERE t.id = c.task_id LIMIT 1)
+    )
+    WHERE (c.source_channel IS NULL OR c.source_channel = '' OR c.source_channel = '未知')
+      AND COALESCE(
+        (SELECT p.source_channel FROM open_post p WHERE p.task_id = c.task_id AND p.feed_id = c.feed_id LIMIT 1),
+        (SELECT NULLIF(t.channel, '') FROM open_collection_task t WHERE t.id = c.task_id LIMIT 1)
+      ) IS NOT NULL
+  `).catch(() => {
+    // 基础采集表不存在或旧库字段未就绪时跳过，服务下次启动会继续迁移。
+  });
+
+  await pool.query(`
+    UPDATE open_comment
+    SET source_sub_channel = '评论区'
+    WHERE source_sub_channel IS NULL OR source_sub_channel = ''
+  `).catch(() => {
+    // 基础采集表不存在或旧库字段未就绪时跳过，服务下次启动会继续迁移。
+  });
+
   // 迁移：为已有表新增 user_type 字段
   await pool.query(`
     ALTER TABLE open_clue_analysis_result ADD COLUMN IF NOT EXISTS user_type text NOT NULL DEFAULT '未拥车'
@@ -112,6 +176,9 @@ export async function ensureClueAnalysisSchema(pool) {
         updated_at = now()
     WHERE status IN ('queued', 'running')
   `);
+
+  await ensureIncubationSchema(pool);
+  await syncIncubationLeads(pool);
 }
 
 export async function startClueAnalysis(pool, { taskId = null, userIds = [] } = {}) {
@@ -171,6 +238,54 @@ export async function getLatestClueResults(pool, { taskId = null } = {}) {
   return result.rows.map(mapResult);
 }
 
+async function ensureIncubationSchema(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS open_incubation_lead (
+      user_id text PRIMARY KEY,
+      latest_result_id uuid REFERENCES open_clue_analysis_result(id) ON DELETE SET NULL,
+      lead_status text NOT NULL DEFAULT 'new' CHECK (lead_status IN ('new', 'following', 'replied', 'converted', 'lost')),
+      reply_count integer NOT NULL DEFAULT 0 CHECK (reply_count >= 0),
+      has_replied boolean NOT NULL DEFAULT false,
+      converted boolean NOT NULL DEFAULT false,
+      last_followed_at timestamptz,
+      next_follow_at timestamptz,
+      owner text,
+      note text,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_open_incubation_lead_status ON open_incubation_lead(lead_status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_open_incubation_lead_latest_result ON open_incubation_lead(latest_result_id);
+
+    CREATE TABLE IF NOT EXISTS open_incubation_followup_event (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id text NOT NULL REFERENCES open_incubation_lead(user_id) ON DELETE CASCADE,
+      event_type text NOT NULL CHECK (event_type IN ('reply', 'call', 'wechat', 'visit', 'converted', 'lost', 'note', 'status')),
+      content text,
+      occurred_at timestamptz NOT NULL DEFAULT now(),
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_open_incubation_event_user ON open_incubation_followup_event(user_id, occurred_at DESC);
+  `);
+}
+
+async function syncIncubationLeads(pool) {
+  await pool.query(`
+    INSERT INTO open_incubation_lead (user_id, latest_result_id)
+    SELECT DISTINCT ON (user_id) user_id, id
+    FROM open_clue_analysis_result
+    ORDER BY user_id, created_at DESC
+    ON CONFLICT (user_id) DO UPDATE
+    SET latest_result_id = EXCLUDED.latest_result_id,
+        updated_at = CASE
+          WHEN open_incubation_lead.latest_result_id IS DISTINCT FROM EXCLUDED.latest_result_id THEN now()
+          ELSE open_incubation_lead.updated_at
+        END
+  `);
+}
+
 export async function getClueScopes(pool) {
   const result = await pool.query(
     `SELECT id, keyword, channel, status, created_at AS "createdAt"
@@ -178,6 +293,265 @@ export async function getClueScopes(pool) {
      ORDER BY created_at DESC`,
   );
   return result.rows;
+}
+
+// 获取所有已评级的孵化线索（360° 列表视图）
+export async function getIncubationLeads(pool) {
+  const result = await pool.query(
+    `WITH latest AS (
+       SELECT DISTINCT ON (user_id)
+         id, job_id, scope_task_id, user_id, nickname, ip_location, rating,
+         confidence::float8 AS confidence, has_purchase_intent, user_type, intent_types,
+         concerns, brands, car_series, competitors, summary, evidence,
+         sales_strategy, dealer_recommendation, data_cutoff_at, post_count,
+         comment_count, model, prompt_version, llm_origin_log, created_at
+       FROM open_clue_analysis_result
+       ORDER BY user_id, created_at DESC
+     ),
+     latest_profile AS (
+       SELECT DISTINCT ON (user_id)
+         user_id, red_id, description, avatar, ip_location AS profile_ip_location
+       FROM open_user_profile
+       ORDER BY user_id, updated_at DESC NULLS LAST, first_seen_at DESC NULLS LAST
+     ),
+     source_rows AS (
+       SELECT user_id, source_channel, source_sub_channel FROM open_user_profile WHERE user_id IS NOT NULL
+       UNION ALL
+       SELECT author_user_id AS user_id, source_channel, source_sub_channel FROM open_post WHERE author_user_id IS NOT NULL
+       UNION ALL
+       SELECT user_id, source_channel, source_sub_channel FROM open_comment WHERE user_id IS NOT NULL
+     ),
+     source_by_user AS (
+       SELECT
+         user_id,
+         array_remove(array_agg(DISTINCT NULLIF(source_channel, '')), NULL) AS source_channels,
+         array_remove(array_agg(DISTINCT NULLIF(source_sub_channel, '')), NULL) AS source_sub_channels
+       FROM source_rows
+       GROUP BY user_id
+     )
+     SELECT latest.*,
+            profile.red_id, profile.description, profile.avatar,
+            COALESCE(latest.ip_location, profile.profile_ip_location) AS display_ip_location,
+            source.source_channels, source.source_sub_channels,
+            lead.lead_status, lead.reply_count, lead.has_replied, lead.converted,
+            lead.last_followed_at, lead.next_follow_at, lead.owner, lead.note,
+            lead.created_at AS lead_created_at, lead.updated_at AS lead_updated_at
+     FROM latest
+     LEFT JOIN latest_profile profile ON profile.user_id = latest.user_id
+     LEFT JOIN source_by_user source ON source.user_id = latest.user_id
+     LEFT JOIN open_incubation_lead lead ON lead.user_id = latest.user_id
+     ORDER BY latest.created_at DESC`,
+  );
+  return result.rows.map(mapResult);
+}
+
+// 获取单个用户的完整 360° 孵化详情
+export async function getIncubationDetail(pool, userId) {
+  const [resultRow, profiles, posts, comments, leadRow, events, sources] = await Promise.all([
+    pool.query(
+      `SELECT id, job_id, scope_task_id, user_id, nickname, ip_location, rating,
+              confidence::float8 AS confidence, has_purchase_intent, user_type, intent_types,
+              concerns, brands, car_series, competitors, summary, evidence,
+              sales_strategy, dealer_recommendation, data_cutoff_at, post_count,
+              comment_count, model, prompt_version, llm_origin_log, created_at
+       FROM open_clue_analysis_result
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId],
+    ),
+    pool.query(
+      `SELECT nickname, red_id, gender, ip_location, description, avatar,
+              source_channel, source_sub_channel,
+              fans_count_text, follows_count_text, liked_and_collected_count_text
+       FROM open_user_profile
+       WHERE user_id = $1
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [userId],
+    ),
+    pool.query(
+      `SELECT task_id, feed_id, source_channel, source_sub_channel, title, description, author_nickname, author_avatar,
+              liked_count_text, shared_count_text, comment_count_text,
+              collected_count_text, ip_location, publish_time
+       FROM open_post
+       WHERE author_user_id = $1
+       ORDER BY publish_time DESC NULLS LAST
+       LIMIT 50`,
+      [userId],
+    ),
+    pool.query(
+      `SELECT task_id, feed_id, source_channel, source_sub_channel, comment_id, parent_comment_id, content,
+              nickname, avatar, ip_location, comment_time, like_count_text
+       FROM open_comment
+       WHERE user_id = $1
+      ORDER BY comment_time DESC NULLS LAST
+      LIMIT 100`,
+      [userId],
+    ),
+    pool.query(
+      `SELECT user_id, latest_result_id, lead_status, reply_count, has_replied, converted,
+              last_followed_at, next_follow_at, owner, note, created_at AS lead_created_at, updated_at AS lead_updated_at
+       FROM open_incubation_lead
+       WHERE user_id = $1`,
+      [userId],
+    ),
+    pool.query(
+      `SELECT id, event_type, content, occurred_at, created_at
+       FROM open_incubation_followup_event
+       WHERE user_id = $1
+      ORDER BY occurred_at DESC
+      LIMIT 20`,
+      [userId],
+    ),
+    pool.query(
+      `WITH rows AS (
+        SELECT source_channel, source_sub_channel FROM open_user_profile WHERE user_id = $1
+        UNION ALL
+        SELECT source_channel, source_sub_channel FROM open_post WHERE author_user_id = $1
+        UNION ALL
+        SELECT source_channel, source_sub_channel FROM open_comment WHERE user_id = $1
+      )
+      SELECT
+        array_remove(array_agg(DISTINCT NULLIF(source_channel, '')), NULL) AS source_channels,
+        array_remove(array_agg(DISTINCT NULLIF(source_sub_channel, '')), NULL) AS source_sub_channels
+      FROM rows`,
+      [userId],
+    ),
+  ]);
+
+  const lead = leadRow.rowCount ? leadRow.rows[0] : null;
+  const analysis = resultRow.rowCount ? mapResult({ ...resultRow.rows[0], ...(lead || {}) }) : null;
+  const profile = profiles.rowCount ? profiles.rows[0] : {};
+  const source = sources.rows[0] || {};
+  const sourceChannels = source.source_channels?.length ? source.source_channels : sourceChannelsForRows([], [profile]);
+  const sourceSubChannels = source.source_sub_channels?.length ? source.source_sub_channels : sourceSubChannelsForRows([profile]);
+
+  return {
+    analysis,
+    followUp: lead ? mapFollowUp(lead) : analysis?.followUp || defaultFollowUp(),
+    followEvents: events.rows.map((event) => ({
+      id: event.id,
+      type: event.event_type,
+      content: event.content || "",
+      occurredAt: event.occurred_at,
+      createdAt: event.created_at,
+    })),
+    profile: {
+      nickname: profile.nickname || analysis?.nickname || userId,
+      redId: profile.red_id || null,
+      gender: profile.gender ?? null,
+      ipLocation: profile.ip_location || analysis?.ipLocation || null,
+      description: profile.description || null,
+      avatar: profile.avatar || null,
+      sourceChannels,
+      sourceSubChannels,
+      fansCount: profile.fans_count_text || null,
+      followsCount: profile.follows_count_text || null,
+      likedAndCollectedCount: profile.liked_and_collected_count_text || null,
+    },
+    posts: posts.rows.map((p) => ({
+      taskId: p.task_id,
+      feedId: p.feed_id,
+      sourceChannel: p.source_channel || null,
+      sourceSubChannel: p.source_sub_channel || null,
+      title: p.title,
+      desc: p.description,
+      authorName: p.author_nickname,
+      authorAvatar: p.author_avatar || null,
+      likedCount: p.liked_count_text,
+      sharedCount: p.shared_count_text,
+      commentCount: p.comment_count_text,
+      collectedCount: p.collected_count_text,
+      ipLocation: p.ip_location,
+      publishTime: p.publish_time,
+    })),
+    comments: comments.rows.map((c) => ({
+      taskId: c.task_id,
+      feedId: c.feed_id,
+      sourceChannel: c.source_channel || null,
+      sourceSubChannel: c.source_sub_channel || null,
+      commentId: c.comment_id,
+      parentCommentId: c.parent_comment_id,
+      content: c.content,
+      nickname: c.nickname,
+      avatar: c.avatar || null,
+      ipLocation: c.ip_location,
+      commentTime: c.comment_time,
+      likeCount: c.like_count_text,
+    })),
+  };
+}
+
+export async function updateIncubationLead(pool, userId, payload = {}) {
+  if (!userId) {
+    const error = new Error("缺少用户 ID");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  await syncIncubationLead(pool, userId);
+
+  const currentResult = await pool.query(
+    `SELECT latest_result_id, lead_status, reply_count, has_replied, converted, last_followed_at, next_follow_at, owner, note
+     FROM open_incubation_lead WHERE user_id = $1`,
+    [userId],
+  );
+  const current = currentResult.rows[0] || {};
+  const nextReplyCount = normalizeReplyCount(payload.replyCount, current.reply_count);
+  const nextConverted = typeof payload.converted === "boolean" ? payload.converted : Boolean(current.converted);
+  const nextHasReplied = typeof payload.hasReplied === "boolean"
+    ? payload.hasReplied
+    : Boolean(current.has_replied || nextReplyCount > 0);
+  const nextStatus = normalizeLeadStatus(payload.status, {
+    fallback: current.lead_status || "new",
+    replyCount: nextReplyCount,
+    hasReplied: nextHasReplied,
+    converted: nextConverted,
+  });
+  const markFollowed = payload.markFollowed !== false && (
+    payload.status !== undefined ||
+    payload.replyCount !== undefined ||
+    payload.hasReplied !== undefined ||
+    payload.converted !== undefined
+  );
+
+  const result = await pool.query(
+    `UPDATE open_incubation_lead
+     SET lead_status = $2,
+         reply_count = $3,
+         has_replied = $4,
+         converted = $5,
+         last_followed_at = CASE WHEN $6 THEN now() ELSE last_followed_at END,
+         next_follow_at = COALESCE($7::timestamptz, next_follow_at),
+         owner = COALESCE($8, owner),
+         note = COALESCE($9, note),
+         updated_at = now()
+     WHERE user_id = $1
+     RETURNING user_id, latest_result_id, lead_status, reply_count, has_replied, converted,
+               last_followed_at, next_follow_at, owner, note, created_at AS lead_created_at, updated_at AS lead_updated_at`,
+    [
+      userId,
+      nextStatus,
+      nextReplyCount,
+      nextHasReplied,
+      nextConverted || nextStatus === "converted",
+      markFollowed,
+      payload.nextFollowAt || null,
+      payload.owner || null,
+      payload.note || null,
+    ],
+  );
+
+  if (payload.eventType || payload.content) {
+    await pool.query(
+      `INSERT INTO open_incubation_followup_event (user_id, event_type, content)
+       VALUES ($1, $2, $3)`,
+      [userId, normalizeEventType(payload.eventType, nextStatus), payload.content || payload.note || ""],
+    );
+  }
+
+  return mapFollowUp(result.rows[0]);
 }
 
 export async function getClueCandidates(pool, { taskId = null } = {}) {
@@ -195,6 +569,8 @@ export async function getClueCandidates(pool, { taskId = null } = {}) {
     const latestAt = [latestComment?.comment_time || latestComment?.created_at, latestPost?.publish_time || latestPost?.collected_at]
       .filter(Boolean)
       .sort((a, b) => dateValue(b) - dateValue(a))[0] || null;
+    const sourceChannels = item.source_channels?.length ? item.source_channels : sourceChannelsForUser(item);
+    const sourceSubChannels = item.source_sub_channels || [];
 
     return {
       id: item.user.user_id,
@@ -203,6 +579,8 @@ export async function getClueCandidates(pool, { taskId = null } = {}) {
       ipLocation: item.user.ip_location,
       redId: item.user.red_id,
       desc: item.user.description,
+      sourceChannels,
+      sourceSubChannels,
       postCount: item.statistics.post_count,
       commentCount: item.statistics.comment_count,
       activityCount: item.statistics.post_count + item.statistics.comment_count,
@@ -220,6 +598,32 @@ export async function getClueCandidates(pool, { taskId = null } = {}) {
       dataCutoffAt: item.data_cutoff_at,
     };
   });
+}
+
+function sourceChannelsForUser(userPackage) {
+  const channelsByTask = new Map((userPackage.scope?.tasks || []).map((task) => [task.id, task.channel || "未知"]));
+  const taskIds = new Set([
+    ...(userPackage.posts || []).map((row) => row.task_id),
+    ...(userPackage.comments || []).map((row) => row.task_id),
+  ].filter(Boolean));
+  return Array.from(taskIds)
+    .map((taskId) => channelsByTask.get(taskId))
+    .filter(Boolean)
+    .filter((channel, index, channels) => channels.indexOf(channel) === index);
+}
+
+function sourceChannelsForRows(tasks, rows) {
+  const channelsByTask = new Map((tasks || []).map((task) => [task.id, task.channel || "未知"]));
+  const channels = Array.from(new Set((rows || [])
+    .map((row) => row.source_channel || channelsByTask.get(row.task_id))
+    .filter(Boolean)));
+  return channels.length ? channels : (rows?.length ? ["小红书"] : []);
+}
+
+function sourceSubChannelsForRows(rows) {
+  return Array.from(new Set((rows || [])
+    .map((row) => row.source_sub_channel)
+    .filter(Boolean)));
 }
 
 async function runClueAnalysis(pool, jobId) {
@@ -296,7 +700,7 @@ async function loadUserPackages(pool, taskId, requestedUserIds) {
     : [taskId || null];
   const [profilesResult, postsResult, commentsResult, tasksResult] = await Promise.all([
     pool.query(
-      `SELECT task_id, user_id, nickname, red_id, gender, ip_location, description,
+      `SELECT task_id, user_id, source_channel, source_sub_channel, nickname, red_id, gender, ip_location, description,
               avatar, fans_count_text, follows_count_text, liked_and_collected_count_text,
               interactions, first_seen_at, updated_at
        FROM open_user_profile
@@ -304,7 +708,7 @@ async function loadUserPackages(pool, taskId, requestedUserIds) {
       params,
     ),
     pool.query(
-      `SELECT task_id, feed_id, title, description, note_type, author_user_id,
+      `SELECT task_id, feed_id, source_channel, source_sub_channel, title, description, note_type, author_user_id,
               author_nickname, liked_count_text, shared_count_text, comment_count_text,
               collected_count_text, ip_location, publish_time, collected_at, updated_at
        FROM open_post
@@ -314,7 +718,7 @@ async function loadUserPackages(pool, taskId, requestedUserIds) {
     ),
     pool.query(
       `SELECT task_id, feed_id, comment_id, parent_comment_id, comment_level, content,
-              user_id, nickname, like_count_text, ip_location, comment_time, show_tags,
+              user_id, source_channel, source_sub_channel, nickname, like_count_text, ip_location, comment_time, show_tags,
               created_at, updated_at
        FROM open_comment
        WHERE user_id IS NOT NULL AND ${taskFilter()}
@@ -324,7 +728,7 @@ async function loadUserPackages(pool, taskId, requestedUserIds) {
     pool.query(
       `SELECT id, keyword, channel, created_at
        FROM open_collection_task
-       WHERE ${taskFilter()}
+       WHERE ${taskFilter().replace(/task_id/g, "id")}
        ORDER BY created_at`,
       params,
     ),
@@ -352,6 +756,8 @@ async function loadUserPackages(pool, taskId, requestedUserIds) {
     return {
       scope: { task_id: taskId || null, tasks: tasksResult.rows },
       user: profile,
+      source_channels: sourceChannelsForRows(tasksResult.rows, [...profiles, ...posts, ...comments]),
+      source_sub_channels: sourceSubChannelsForRows([...profiles, ...posts, ...comments]),
       statistics: { post_count: posts.length, comment_count: comments.length },
       posts,
       comments,
@@ -591,7 +997,7 @@ async function saveAnalysisResult(pool, job, userPackage, analysis) {
   const rawInput = JSON.stringify(userPackage);
   const rawOutput = JSON.stringify(analysis.raw);
   const llmOriginLog = JSON.stringify({ input: userPackage, output: analysis.raw });
-  await pool.query(
+  const result = await pool.query(
     `INSERT INTO open_clue_analysis_result (
        job_id, scope_task_id, user_id, nickname, ip_location, rating, confidence,
        has_purchase_intent, user_type, intent_types, concerns, brands, car_series, competitors,
@@ -601,7 +1007,8 @@ async function saveAnalysisResult(pool, job, userPackage, analysis) {
        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb,
        $13::jsonb, $14::jsonb, $15, $16::jsonb, $17::jsonb, $18::jsonb, $19,
        $20, $21, $22, $23, $24, $25::jsonb, $26::jsonb, $27::jsonb
-     )`,
+     )
+     RETURNING id`,
     [
       job.id, job.scope_task_id, userPackage.user.user_id, userPackage.user.nickname,
       userPackage.user.ip_location, analysis.rating, analysis.confidence,
@@ -614,6 +1021,7 @@ async function saveAnalysisResult(pool, job, userPackage, analysis) {
       rawOutput, llmOriginLog,
     ],
   );
+  await syncIncubationLead(pool, userPackage.user.user_id, result.rows[0]?.id);
 }
 
 async function updateJobProgress(pool, jobId, success, nickname, error) {
@@ -699,7 +1107,12 @@ function mapResult(row) {
     taskId: row.scope_task_id,
     userId: row.user_id,
     nickname: row.nickname,
-    ipLocation: row.ip_location,
+    ipLocation: row.display_ip_location || row.ip_location,
+    redId: row.red_id || null,
+    desc: row.description || null,
+    avatar: row.avatar || null,
+    sourceChannels: row.source_channels || [],
+    sourceSubChannels: row.source_sub_channels || [],
     rating: row.rating,
     confidence: row.confidence,
     hasPurchaseIntent: row.has_purchase_intent,
@@ -720,7 +1133,100 @@ function mapResult(row) {
     model: row.model,
     promptVersion: row.prompt_version,
     createdAt: row.created_at,
+    followUp: mapFollowUp(row),
   };
+}
+
+async function syncIncubationLead(pool, userId, resultId = null) {
+  if (!userId) return;
+  const latestResult = resultId
+    ? { rows: [{ id: resultId }], rowCount: 1 }
+    : await pool.query(
+      `SELECT id FROM open_clue_analysis_result
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId],
+    );
+  if (!latestResult.rowCount) return;
+
+  await pool.query(
+    `INSERT INTO open_incubation_lead (user_id, latest_result_id)
+     VALUES ($1, $2)
+     ON CONFLICT (user_id) DO UPDATE
+     SET latest_result_id = EXCLUDED.latest_result_id,
+         updated_at = CASE
+           WHEN open_incubation_lead.latest_result_id IS DISTINCT FROM EXCLUDED.latest_result_id THEN now()
+           ELSE open_incubation_lead.updated_at
+         END`,
+    [userId, latestResult.rows[0].id],
+  );
+}
+
+function mapFollowUp(row = {}) {
+  return {
+    status: row.lead_status || "new",
+    statusLabel: leadStatusLabel(row.lead_status || "new"),
+    replyCount: Number(row.reply_count || 0),
+    hasReplied: Boolean(row.has_replied),
+    converted: Boolean(row.converted),
+    lastFollowedAt: row.last_followed_at || null,
+    nextFollowAt: row.next_follow_at || null,
+    owner: row.owner || null,
+    note: row.note || null,
+    createdAt: row.lead_created_at || null,
+    updatedAt: row.lead_updated_at || null,
+  };
+}
+
+function defaultFollowUp() {
+  return mapFollowUp({});
+}
+
+function normalizeLeadStatus(status, { fallback = "new", replyCount = 0, hasReplied = false, converted = false } = {}) {
+  const normalized = typeof status === "string" ? status.trim() : "";
+  const alias = {
+    new: "new",
+    未跟进: "new",
+    following: "following",
+    跟进中: "following",
+    replied: "replied",
+    已回复: "replied",
+    converted: "converted",
+    已成交: "converted",
+    lost: "lost",
+    已流失: "lost",
+  };
+  const value = alias[normalized] || normalized;
+  if (["new", "following", "replied", "converted", "lost"].includes(value)) return value;
+  if (converted) return "converted";
+  if (hasReplied || replyCount > 0) return "replied";
+  return ["new", "following", "replied", "converted", "lost"].includes(fallback) ? fallback : "new";
+}
+
+function normalizeReplyCount(value, fallback = 0) {
+  if (value === undefined || value === null || value === "") return Math.max(0, Number(fallback) || 0);
+  return Math.max(0, Math.floor(Number(value) || 0));
+}
+
+function normalizeEventType(eventType, status) {
+  const value = typeof eventType === "string" ? eventType.trim() : "";
+  if (["reply", "call", "wechat", "visit", "converted", "lost", "note", "status"].includes(value)) return value;
+  if (status === "converted") return "converted";
+  if (status === "lost") return "lost";
+  if (status === "replied") return "reply";
+  return "status";
+}
+
+function leadStatusLabel(status) {
+  const map = {
+    new: "未跟进",
+    following: "跟进中",
+    replied: "已回复",
+    converted: "已成交",
+    lost: "已流失",
+  };
+  return map[status] || "未跟进";
 }
 
 function assertDeepSeekConfig() {

@@ -183,20 +183,16 @@ class ServerBackedPersistenceAdapter extends LocalPersistenceAdapter {
   // 读操作：PG 加载 → localStorage 镜像 → 返回 PG 数据
   // PG 不可达时降级到 localStorage（离线兜底）
 
-  // 页面加载：localStorage 为准；PG 数据仅作为冷启动种子
+  // 页面加载：始终从 PG 拉取最新数据，localStorage 仅作为 PG 不可达时的兜底
   async loadRemoteCache() {
-    const localCache = this.loadCache();
-    // localStorage 有数据时信任本地（避免 PG 旧数据覆盖本地操作）
-    if (localCache.tasks.length > 0 || localCache.posts.length > 0) {
-      return localCache;
-    }
-    // 本地为空（首次访问），从 PG 拉取
-    const remoteCache = await this.syncRemote<LocalCache>("/api/storage/cache");
+    // 数据量大（2000+ posts, 5000+ comments），给足够超时时间
+    const remoteCache = await this.syncRemote<LocalCache>("/api/storage/cache", {}, 15000);
     if (remoteCache) {
       this.write(remoteCache);
       return remoteCache;
     }
-    return localCache;
+    // PG 不可达，降级到本地
+    return this.loadCache();
   }
 
   // ========== 写操作：PG 先写，成功后镜像到 localStorage ==========

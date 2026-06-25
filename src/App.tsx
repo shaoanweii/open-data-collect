@@ -9,6 +9,7 @@ import {
   RefreshCw,
   Search,
   Settings,
+  Target,
   UserRound,
   X,
 } from "lucide-react";
@@ -19,6 +20,7 @@ import { taskControl } from "./lib/task-control";
 import { CollectPage } from "./pages/collect/CollectPage";
 import { CommentDataPage } from "./pages/comments/CommentDataPage";
 import { CluePoolPage } from "./pages/clue-pool/CluePoolPage";
+import { IncubationPoolPage } from "./pages/incubation/IncubationPoolPage";
 import { PostDataPage } from "./pages/posts/PostDataPage";
 import { SystemSettingsPage } from "./pages/settings/SystemSettingsPage";
 import { TaskQueuePage } from "./pages/tasks/TaskQueuePage";
@@ -39,7 +41,7 @@ import type {
   StoredUser,
 } from "./types";
 
-type ViewKey = "collect" | "tasks" | "posts" | "comments" | "users" | "clue_pool" | "userpool";
+type ViewKey = "collect" | "tasks" | "posts" | "comments" | "users" | "clue_pool" | "incubation" | "userpool";
 type PendingCollectionRequest = {
   keyword: string;
   channel: string;
@@ -84,6 +86,7 @@ const navItems: Array<{ key: ViewKey; label: string; icon: React.ComponentType<{
   { key: "userpool", label: "用户池", icon: UserRound },
   { key: "users", label: "系统设置", icon: Settings },
   { key: "clue_pool", label: "线索池", icon: Lightbulb },
+  { key: "incubation", label: "建档线索", icon: Target },
 ];
 
 // 路径到视图的映射
@@ -97,6 +100,7 @@ const pathToViewMap: Record<string, ViewKey> = {
   "/systems-data": "users",
   "/user-pool": "userpool",
   "/clue-pool": "clue_pool",
+  "/incubation": "incubation",
 };
 
 function pathToView(pathname: string): ViewKey {
@@ -113,6 +117,7 @@ function viewToPath(view: ViewKey): string {
     users: "/systems-data",
     userpool: "/user-pool",
     clue_pool: "/clue-pool",
+    incubation: "/incubation",
   };
   return map[view] ?? "/";
 }
@@ -704,6 +709,18 @@ export function App() {
         )}
         {view === "clue_pool" && (
           <CluePoolPage
+            onOpenUser={(userId) => {
+              setFocusedUserId(userId);
+              navigate("/user-pool");
+            }}
+            onNavigateToPost={(feedId) => {
+              setSelectedFeedId(feedId);
+              navigate("/tiezi-data");
+            }}
+          />
+        )}
+        {view === "incubation" && (
+          <IncubationPoolPage
             onOpenUser={(userId) => {
               setFocusedUserId(userId);
               navigate("/user-pool");

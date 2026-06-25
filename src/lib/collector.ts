@@ -570,6 +570,8 @@ function toStoredPost(taskId: string, detail: FeedDetailData, queueItem: QueueIt
   return {
     taskId,
     feedId: detail.feed_id || queueItem.feedId,
+    sourceChannel: "小红书",
+    sourceSubChannel: "主贴详情",
     title: note?.title || queueItem.title,
     desc: note?.desc,
     authorId: note?.user?.userId || queueItem.authorId,
@@ -596,6 +598,8 @@ function toStoredComments(taskId: string, detail: FeedDetailData): StoredComment
       .map<StoredComment>((item) => ({
         taskId,
         feedId,
+        sourceChannel: "小红书",
+        sourceSubChannel: "评论区",
         commentId: item.id ?? "",
         parentCommentId: comment.id,
         content: item.content,
@@ -620,6 +624,8 @@ function toStoredComment(taskId: string, feedId: string, comment: FeedComment): 
   return {
     taskId,
     feedId,
+    sourceChannel: "小红书",
+    sourceSubChannel: "评论区",
     commentId: comment.id,
     content: comment.content,
     userId: comment.userInfo?.userId,
@@ -660,6 +666,8 @@ function toStoredUser(taskId: string, userId: string, profile: UserProfileData):
   return {
     taskId,
     userId,
+    sourceChannel: "小红书",
+    sourceSubChannel: "用户主页",
     nickname: info?.nickname,
     redId: info?.redId,
     avatar: info?.avatar || extractAvatarUrl(info?.images) || extractAvatarUrl(info?.imageb),

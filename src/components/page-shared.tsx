@@ -5,11 +5,13 @@ import {
   ArrowDown,
   ArrowUp,
   CalendarDays,
+  ChevronDown,
   Clock3,
   FileText,
   Loader2,
   MessageSquareText,
   MoreHorizontal,
+  Search,
   UserRound,
   UsersRound,
 } from "lucide-react";
@@ -258,7 +260,24 @@ function FilterDropdown<T extends string>({
   );
 }
 
-function DateRangeFilter({
+// 日期快捷选项
+const DATE_PRESETS: Array<{ label: string; from: string; to: string }> = (() => {
+  const today = new Date();
+  const fmt = (d: Date) => d.toISOString().slice(0, 10);
+  const daysAgo = (n: number) => { const d = new Date(today); d.setDate(d.getDate() - n); return d; };
+  return [
+    { label: "今天", from: fmt(today), to: fmt(today) },
+    { label: "昨天", from: fmt(daysAgo(1)), to: fmt(daysAgo(1)) },
+    { label: "过去 7 天", from: fmt(daysAgo(6)), to: fmt(today) },
+    { label: "过去 14 天", from: fmt(daysAgo(13)), to: fmt(today) },
+    { label: "过去 30 天", from: fmt(daysAgo(29)), to: fmt(today) },
+    { label: "过去 90 天", from: fmt(daysAgo(89)), to: fmt(today) },
+    { label: "过去半年", from: fmt(daysAgo(179)), to: fmt(today) },
+    { label: "自定义", from: "", to: "" },
+  ];
+})();
+
+export function DateRangeFilter({
   dateFrom,
   dateTo,
   onChangeFrom,
@@ -269,29 +288,102 @@ function DateRangeFilter({
   onChangeFrom: (value: string) => void;
   onChangeTo: (value: string) => void;
 }) {
-  // 点击输入框时阻止冒泡，确保日期选择器正常弹出
-  const stopPropagation = (event: React.MouseEvent) => event.stopPropagation();
+  const fromRef = useRef<HTMLInputElement>(null);
+  const toRef = useRef<HTMLInputElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [activePicker, setActivePicker] = useState<"from" | "to" | null>(null);
+  const [presetOpen, setPresetOpen] = useState(false);
+
+  // 匹配当前选中日期对应的预设标签
+  const activePreset = DATE_PRESETS.find((p) => p.from === dateFrom && p.to === dateTo)?.label || "自定义";
+
+  // 点击容器区域时弹出开始日期选择器
+  const handleContainerClick = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest(".date-preset-trigger, .date-preset-popup")) return;
+    if (!activePicker) {
+      fromRef.current?.showPicker?.();
+      setActivePicker("from");
+    } else if (activePicker === "from") {
+      toRef.current?.showPicker?.();
+      setActivePicker("to");
+    } else {
+      setActivePicker(null);
+    }
+  };
+
+  // 选择快捷日期
+  const handlePreset = (preset: typeof DATE_PRESETS[number]) => {
+    if (preset.from) {
+      onChangeFrom(preset.from);
+      onChangeTo(preset.to);
+    }
+    setPresetOpen(false);
+    // 如果是自定义，弹出开始日期选择器
+    if (!preset.from) {
+      setTimeout(() => fromRef.current?.showPicker?.(), 100);
+      setActivePicker("from");
+    }
+  };
+
+  // 点击外部关闭预设面板
+  useEffect(() => {
+    if (!presetOpen) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setPresetOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [presetOpen]);
+
   return (
-    <div className="date-range-filter">
-      <span className="date-range-label">时间范围</span>
-      <div className="date-range-control">
-        <CalendarDays size={18} />
-        <input
-          aria-label="开始日期"
-          type="date"
-          value={dateFrom}
-          onClick={stopPropagation}
-          onChange={(event) => onChangeFrom(event.target.value)}
-        />
-        <span className="date-range-separator">至</span>
-        <input
-          aria-label="结束日期"
-          type="date"
-          value={dateTo}
-          onClick={stopPropagation}
-          onChange={(event) => onChangeTo(event.target.value)}
-        />
-      </div>
+    <div className="date-range-inline" ref={containerRef} onClick={handleContainerClick}>
+      <CalendarDays size={14} />
+      <input
+        ref={fromRef}
+        type="date"
+        aria-label="开始日期"
+        value={dateFrom}
+        onChange={(e) => {
+          onChangeFrom(e.target.value);
+          setTimeout(() => toRef.current?.showPicker?.(), 100);
+          setActivePicker("to");
+        }}
+      />
+      <span className="date-range-inline-sep">至</span>
+      <input
+        ref={toRef}
+        type="date"
+        aria-label="结束日期"
+        value={dateTo}
+        onChange={(e) => {
+          onChangeTo(e.target.value);
+          setActivePicker(null);
+        }}
+      />
+      <button
+        type="button"
+        className="date-preset-trigger"
+        onClick={(e) => { e.stopPropagation(); setPresetOpen((v) => !v); }}
+      >
+        {activePreset}
+        <ChevronDown size={12} />
+      </button>
+      {presetOpen && (
+        <div className="date-preset-popup">
+          {DATE_PRESETS.map((p) => (
+            <button
+              key={p.label}
+              type="button"
+              className={`date-preset-option ${p.label === activePreset ? "active" : ""}`}
+              onClick={() => handlePreset(p)}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -341,8 +433,35 @@ export function TaskQueue({
 }) {
   const [openMenuTaskId, setOpenMenuTaskId] = useState<string | null>(null);
   const [logTask, setLogTask] = useState<CollectionTask | null>(null);
+  // 日期筛选，默认过去14天
+  const [dateFrom, setDateFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 14);
+    return d.toISOString().slice(0, 10);
+  });
+  const [dateTo, setDateTo] = useState("");
+  // 关键词搜索
+  const [searchKeyword, setSearchKeyword] = useState("");
   // 每个 task 独立一个 ref，避免 map 中 ref 被覆盖导致菜单点击无效
   const menuRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  // 过滤任务列表
+  const filteredTasks = useMemo(() => {
+    return tasks.filter((task) => {
+      // 日期筛选
+      const taskDate = task.createdAt ? task.createdAt.slice(0, 10) : "";
+      if (taskDate) {
+        if (dateFrom && taskDate < dateFrom) return false;
+        if (dateTo && taskDate > dateTo) return false;
+      }
+      // 关键词搜索
+      if (searchKeyword) {
+        const q = searchKeyword.toLowerCase();
+        if (!(task.keyword || "").toLowerCase().includes(q)) return false;
+      }
+      return true;
+    });
+  }, [tasks, dateFrom, dateTo, searchKeyword]);
 
   // 点击菜单外部时关闭菜单
   useEffect(() => {
@@ -375,15 +494,34 @@ export function TaskQueue({
   }
 
   return (
-    <section className="data-panel glass task-list-panel">
-      <div className="panel-heading">
-        <div>
-          <h3>任务列表</h3>
+    <section className="data-panel glass task-list-panel" style={{ overflow: "hidden", display: "grid", gridTemplateRows: "auto minmax(0, 1fr)" }}>
+      <div>
+        <div className="panel-heading">
+          <div>
+            <h3>任务列表</h3>
+          </div>
+        </div>
+        <div className="post-table-toolbar" style={{ marginBottom: 0 }}>
+          <DateRangeFilter
+            dateFrom={dateFrom}
+            dateTo={dateTo}
+            onChangeFrom={setDateFrom}
+            onChangeTo={setDateTo}
+          />
+          <div className="user-search-bar" style={{ minWidth: 220 }}>
+            <Search size={16} />
+            <input
+              type="text"
+              placeholder="搜索采集关键词"
+              value={searchKeyword}
+              onChange={(e) => setSearchKeyword(e.target.value)}
+            />
+          </div>
         </div>
       </div>
 
-      <div className="task-table">
-        <div className="task-table-scroll">
+      <div className="task-table" style={{ borderTop: 'none' }}>
+        <div className="task-table-scroll" style={{ overflowY: "scroll", minHeight: 0 }}>
         <div className="task-table-head">
           <span>任务 ID</span>
           <span>采集关键词</span>
@@ -392,14 +530,14 @@ export function TaskQueue({
           <span>状态</span>
           <span>操作</span>
         </div>
-        {!tasks.length && (
+        {!filteredTasks.length && (
           <div className="task-table-empty">
             <Clock3 size={24} />
             <strong>暂无任务</strong>
             <p>创建采集任务后，会在这里显示任务ID、任务名称、创建时间、状态和操作。</p>
           </div>
         )}
-        {tasks.map((task) => (
+        {filteredTasks.map((task) => (
           <div className="task-table-row" key={task.id}>
             <button className="task-id-button" type="button" onClick={() => onSelectTask(task.id)}>
               {shortTaskId(task.id)}
@@ -881,7 +1019,12 @@ export function PostTable({
 }) {
   const [channelFilter, setChannelFilter] = useState("全部");
   const [statusFilter, setStatusFilter] = useState<CollectionTask["items"][number]["status"] | "全部">("全部");
-  const [dateFrom, setDateFrom] = useState("");
+  // 默认查询过去14天的帖子
+  const [dateFrom, setDateFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 14);
+    return d.toISOString().slice(0, 10);
+  });
   const [dateTo, setDateTo] = useState("");
   const [failureReason, setFailureReason] = useState<{ title: string; error: string } | null>(null);
   const [batchMode, setBatchMode] = useState(false);
@@ -1115,11 +1258,34 @@ export function PostTable({
 }
 
 export function CommentTable({ comments, users }: { comments: StoredComment[]; users: StoredUser[] }) {
+  // 默认查询过去14天的评论
+  const [dateFrom, setDateFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 14);
+    return d.toISOString().slice(0, 10);
+  });
+  const [dateTo, setDateTo] = useState("");
   const [page, setPage] = useState(1);
+
+  const filtered = useMemo(() => {
+    if (!dateFrom && !dateTo) return comments;
+    return comments.filter((c) => {
+      const commentDate = c.createTime ? new Date(c.createTime).toISOString().slice(0, 10) : "";
+      if (!commentDate) return true;
+      if (dateFrom && commentDate < dateFrom) return false;
+      if (dateTo && commentDate > dateTo) return false;
+      return true;
+    });
+  }, [comments, dateFrom, dateTo]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [dateFrom, dateTo]);
+
   const pageSize = 20;
-  const totalPages = Math.max(1, Math.ceil(comments.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const safePage = Math.min(page, totalPages);
-  const pageComments = comments.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const pageComments = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
 
   if (!comments.length) {
     return <EmptyState icon={MessageSquareText} title="暂无评论样本" text="开启评论采集后，一级和二级评论会拆成独立记录。" />;
@@ -1127,12 +1293,22 @@ export function CommentTable({ comments, users }: { comments: StoredComment[]; u
 
   return (
     <section className="data-panel glass" style={{ overflow: "hidden", display: "grid", gridTemplateRows: "auto minmax(0, 1fr) auto" }}>
-      <div className="panel-heading">
-        <div>
-          <h3>评论池</h3>
+      <div>
+        <div className="panel-heading">
+          <div>
+            <h3>评论池</h3>
+          </div>
+        </div>
+        <div className="post-table-toolbar">
+          <DateRangeFilter
+            dateFrom={dateFrom}
+            dateTo={dateTo}
+            onChangeFrom={setDateFrom}
+            onChangeTo={setDateTo}
+          />
         </div>
       </div>
-      <div className="table" style={{ overflowY: "auto", minHeight: 0 }}>
+      <div className="table comments-data-table" style={{ overflowY: "scroll", minHeight: 0 }}>
         <div className="comments-table-head">
           <span>内容</span>
           <span>用户名</span>
@@ -1173,7 +1349,7 @@ export function CommentTable({ comments, users }: { comments: StoredComment[]; u
           上一页
         </button>
         <span>
-          共 {comments.length} 行 · 第 {safePage} / {totalPages} 页 · 每页 20 行
+          共 {filtered.length} 行 · 第 {safePage} / {totalPages} 页 · 每页 20 行
         </span>
         <button type="button" disabled={safePage >= totalPages} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>
           下一页
@@ -1493,6 +1669,8 @@ export function UserPool({
   const [sortKey, setSortKey] = useState<"postCount" | "commentCount" | "fans" | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [page, setPage] = useState(1);
+  // 用户搜索：支持用户ID、昵称、小红书号
+  const [searchQuery, setSearchQuery] = useState("");
 
   // 统计每个用户的帖子数和评论数
   const postCountMap = useMemo(() => {
@@ -1522,10 +1700,18 @@ export function UserPool({
     return comments.filter((c) => c.userId === expandedUserId);
   }, [comments, expandedUserId]);
 
-  // 排序后的用户列表
+  // 按搜索关键词过滤 + 排序后的用户列表
   const sortedUsers = useMemo(() => {
-    if (!sortKey) return users;
-    const sorted = [...users].sort((a, b) => {
+    const filtered = !searchQuery
+      ? users
+      : users.filter((u) => {
+          const query = searchQuery.toLowerCase();
+          return (u.userId || "").toLowerCase().includes(query)
+            || (u.nickname || "").toLowerCase().includes(query)
+            || (u.redId || "").toLowerCase().includes(query);
+        });
+    if (!sortKey) return filtered;
+    const sorted = [...filtered].sort((a, b) => {
       let valA = 0;
       let valB = 0;
       if (sortKey === "postCount") {
@@ -1541,7 +1727,7 @@ export function UserPool({
       return sortDir === "desc" ? valB - valA : valA - valB;
     });
     return sorted;
-  }, [users, postCountMap, commentCountMap, sortKey, sortDir]);
+  }, [users, postCountMap, commentCountMap, sortKey, sortDir, searchQuery]);
 
   // 切换排序
   function toggleSort(key: "postCount" | "commentCount" | "fans") {
@@ -1553,10 +1739,10 @@ export function UserPool({
     }
   }
 
-  // 排序变更时重置到第一页
+  // 排序、搜索变更时重置到第一页
   useEffect(() => {
     setPage(1);
-  }, [sortKey, sortDir]);
+  }, [sortKey, sortDir, searchQuery]);
 
   useEffect(() => {
     if (!focusedUserId) return;
@@ -1594,8 +1780,17 @@ export function UserPool({
         <div>
           <h3>用户池</h3>
         </div>
+        <div className="user-search-bar">
+          <Search size={16} />
+          <input
+            type="text"
+            placeholder="搜索用户ID / 昵称 / 小红书号"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
       </div>
-      <div className="user-list-table" style={{ padding: "4px 0", overflowY: "auto", minHeight: 0 }}>
+      <div className="user-list-table" style={{ padding: "4px 0", overflowY: "scroll", minHeight: 0 }}>
         <div className="user-list-table-head">
           <span>用户</span>
           <span>渠道</span>
